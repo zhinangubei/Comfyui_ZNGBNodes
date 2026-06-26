@@ -458,6 +458,9 @@ class ZNGBAudioCrop:
                                          "tooltip": "Start position in seconds."}),
                 "duration": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01,
                                        "tooltip": "Length to keep in seconds (0 = until the end)."}),
+                "sample_rate": ("INT", {"default": 44100, "min": 1, "max": 384000, "step": 1,
+                                        "tooltip": "Sample rate used only for the silent audio "
+                                                   "generated when audio is null and duration > 0."}),
             },
             "optional": {
                 "audio": ("AUDIO",),
@@ -469,10 +472,16 @@ class ZNGBAudioCrop:
     FUNCTION = "crop"
     CATEGORY = "ZNGBNodes/audio"
     DESCRIPTION = ("Trims an audio clip by start time and duration (in seconds). "
-                   "If audio is null, the output is null.")
+                   "If audio is null: when duration > 0 it outputs silent audio of that length, "
+                   "otherwise the output stays null.")
 
-    def crop(self, start_time, duration, audio=None):
+    def crop(self, start_time, duration, sample_rate, audio=None):
         if audio is None:
+            # No input audio: only synthesize silence when a positive duration is requested.
+            if duration and duration > 0:
+                num_samples = int(duration * sample_rate)
+                silent = torch.zeros((1, 1, num_samples), dtype=torch.float32)
+                return ({"waveform": silent, "sample_rate": int(sample_rate)},)
             return (None,)
 
         waveform = audio["waveform"]
