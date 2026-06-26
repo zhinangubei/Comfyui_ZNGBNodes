@@ -15,6 +15,7 @@ import urllib.parse
 import urllib.request
 
 import torch
+import torchaudio
 
 import folder_paths
 import comfy.model_management as model_management
@@ -70,6 +71,119 @@ def _download_video(url: str) -> str:
         shutil.copyfileobj(resp, f)
     os.replace(tmp, dest)
     return dest
+
+
+def _parse_pad_color(pad_color, channels):
+    """Parse a "R, G, B" string into a list of 0-1 floats, broadcast to `channels`."""
+    parts = [p.strip() for p in str(pad_color).replace(";", ",").split(",") if p.strip() != ""]
+    try:
+        vals = [float(p) / 255.0 for p in parts]
+    except ValueError:
+        vals = [0.0]
+    if not vals:
+        vals = [0.0]
+    if len(vals) == 1:
+        vals = vals * channels
+    return vals
+
+
+def _resize_image_tensor(image, width, height, upscale_method, keep_proportion,
+                         pad_color, crop_position, divisible_by, device="cpu"):
+    """Resize an IMAGE tensor [B,H,W,C]; shared by Resize Image and Video Clip."""
+    B, H, W, C = image.shape
+    dev = model_management.get_torch_device() if device == "gpu" else torch.device("cpu")
+    img = image.to(dev)
+
+    pad_left = pad_right = pad_top = pad_bottom = 0
+
+    if keep_proportion in ("resize", "pad"):
+        if width == 0 and height == 0:
+            new_w, new_h = W, H
+        elif width == 0:
+            ratio = height / H
+            new_w, new_h = round(W * ratio), height
+        elif height == 0:
+            ratio = width / W
+            new_w, new_h = width, round(H * ratio)
+        else:
+            ratio = min(width / W, height / H)
+            new_w, new_h = round(W * ratio), round(H * ratio)
+
+        if keep_proportion == "pad":
+            target_w = width if width else new_w
+            target_h = height if height else new_h
+            if crop_position == "center":
+                pad_left = (target_w - new_w) // 2
+                pad_right = target_w - new_w - pad_left
+                pad_top = (target_h - new_h) // 2
+                pad_bottom = target_h - new_h - pad_top
+            elif crop_position == "top":
+                pad_left = (target_w - new_w) // 2
+                pad_right = target_w - new_w - pad_left
+                pad_top = 0
+                pad_bottom = target_h - new_h
+            elif crop_position == "bottom":
+                pad_left = (target_w - new_w) // 2
+                pad_right = target_w - new_w - pad_left
+                pad_top = target_h - new_h
+                pad_bottom = 0
+            elif crop_position == "left":
+                pad_left = 0
+                pad_right = target_w - new_w
+                pad_top = (target_h - new_h) // 2
+                pad_bottom = target_h - new_h - pad_top
+            elif crop_position == "right":
+                pad_left = target_w - new_w
+                pad_right = 0
+                pad_top = (target_h - new_h) // 2
+                pad_bottom = target_h - new_h - pad_top
+            pad_left, pad_right = max(0, pad_left), max(0, pad_right)
+            pad_top, pad_bottom = max(0, pad_top), max(0, pad_bottom)
+
+        width, height = new_w, new_h
+    else:
+        if width == 0:
+            width = W
+        if height == 0:
+            height = H
+
+    if divisible_by > 1:
+        width = width - (width % divisible_by)
+        height = height - (height % divisible_by)
+
+    if keep_proportion == "crop":
+        old_h, old_w = img.shape[-3], img.shape[-2]
+        old_aspect = old_w / old_h
+        new_aspect = width / height
+        if old_aspect > new_aspect:
+            crop_w, crop_h = round(old_h * new_aspect), old_h
+        else:
+            crop_w, crop_h = old_w, round(old_w / new_aspect)
+        if crop_position == "center":
+            x, y = (old_w - crop_w) // 2, (old_h - crop_h) // 2
+        elif crop_position == "top":
+            x, y = (old_w - crop_w) // 2, 0
+        elif crop_position == "bottom":
+            x, y = (old_w - crop_w) // 2, old_h - crop_h
+        elif crop_position == "left":
+            x, y = 0, (old_h - crop_h) // 2
+        elif crop_position == "right":
+            x, y = old_w - crop_w, (old_h - crop_h) // 2
+        img = img.narrow(-2, x, crop_w).narrow(-3, y, crop_h)
+
+    img = common_upscale(img.movedim(-1, 1), width, height, upscale_method, "disabled").movedim(1, -1)
+
+    if keep_proportion == "pad" and (pad_left or pad_right or pad_top or pad_bottom):
+        color = _parse_pad_color(pad_color, C)
+        padded_h = height + pad_top + pad_bottom
+        padded_w = width + pad_left + pad_right
+        canvas = torch.empty((img.shape[0], padded_h, padded_w, C), dtype=img.dtype, device=img.device)
+        for ch in range(C):
+            canvas[..., ch] = color[ch] if ch < len(color) else 0.0
+        canvas[:, pad_top:pad_top + height, pad_left:pad_left + width, :] = img
+        img = canvas
+
+    return img.cpu()
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +326,10 @@ class ZNGBAudioConcatMulti:
         return {
             "required": {
                 "inputcount": ("INT", {"default": 2, "min": 1, "max": 1000, "step": 1}),
+                "sample_rate": ("INT", {"default": 44100, "min": 1, "max": 384000, "step": 1,
+                                        "tooltip": "Target sample rate. Every input is resampled to "
+                                                   "this rate before concatenation (this keeps each "
+                                                   "clip's duration unchanged)."}),
             },
             "optional": {
                 "audio_1": ("AUDIO",),
@@ -223,25 +341,24 @@ class ZNGBAudioConcatMulti:
     RETURN_NAMES = ("audio",)
     FUNCTION = "concat"
     CATEGORY = "ZNGBNodes/audio"
-    DESCRIPTION = ("Concatenates multiple audios one after another (in input order). Any input "
-                   "may be null and is skipped. If every input is null, the output is null.")
+    DESCRIPTION = ("Concatenates multiple audios one after another (in input order). Inputs with "
+                   "different sample rates are resampled to the target sample_rate (durations are "
+                   "preserved). Any input may be null and is skipped. If every input is null, the "
+                   "output is null.")
 
-    def concat(self, inputcount, **kwargs):
+    def concat(self, inputcount, sample_rate, **kwargs):
+        target_sr = int(sample_rate)
         waveforms = []
-        sample_rate = None
 
         for c in range(inputcount):
             audio = kwargs.get(f"audio_{c + 1}")
             if audio is None:
                 continue
             wf = audio["waveform"]
-            sr = audio["sample_rate"]
-            if sample_rate is None:
-                sample_rate = sr
-            elif sr != sample_rate:
-                raise ValueError(
-                    f"Sample rate mismatch: audio_{c + 1} is {sr} Hz but expected {sample_rate} Hz."
-                )
+            sr = int(audio["sample_rate"])
+            if sr != target_sr:
+                # Resample to the target rate; this changes the sample count but keeps duration.
+                wf = torchaudio.functional.resample(wf, sr, target_sr)
             waveforms.append(wf)
 
         if not waveforms:
@@ -258,7 +375,7 @@ class ZNGBAudioConcatMulti:
             padded.append(wf)
 
         combined = torch.cat(padded, dim=2)
-        return ({"waveform": combined, "sample_rate": sample_rate},)
+        return ({"waveform": combined, "sample_rate": target_sr},)
 
 
 # ---------------------------------------------------------------------------
@@ -330,119 +447,14 @@ class ZNGBResizeImage:
     DESCRIPTION = ("Resizes an image, similar to KJNodes' Resize Image v2 (without mask). "
                    "If image is null, the image/width/height outputs are all null.")
 
-    @staticmethod
-    def _parse_color(pad_color, channels):
-        parts = [p.strip() for p in str(pad_color).replace(";", ",").split(",") if p.strip() != ""]
-        try:
-            vals = [float(p) / 255.0 for p in parts]
-        except ValueError:
-            vals = [0.0]
-        if not vals:
-            vals = [0.0]
-        if len(vals) == 1:
-            vals = vals * channels
-        return vals
-
     def resize(self, width, height, upscale_method, keep_proportion, pad_color,
                crop_position, divisible_by, image=None, device="cpu"):
         if image is None:
             return (None, None, None)
 
-        B, H, W, C = image.shape
-        dev = model_management.get_torch_device() if device == "gpu" else torch.device("cpu")
-        img = image.to(dev)
-
-        pad_left = pad_right = pad_top = pad_bottom = 0
-
-        if keep_proportion in ("resize", "pad"):
-            if width == 0 and height == 0:
-                new_w, new_h = W, H
-            elif width == 0:
-                ratio = height / H
-                new_w, new_h = round(W * ratio), height
-            elif height == 0:
-                ratio = width / W
-                new_w, new_h = width, round(H * ratio)
-            else:
-                ratio = min(width / W, height / H)
-                new_w, new_h = round(W * ratio), round(H * ratio)
-
-            if keep_proportion == "pad":
-                target_w = width if width else new_w
-                target_h = height if height else new_h
-                if crop_position == "center":
-                    pad_left = (target_w - new_w) // 2
-                    pad_right = target_w - new_w - pad_left
-                    pad_top = (target_h - new_h) // 2
-                    pad_bottom = target_h - new_h - pad_top
-                elif crop_position == "top":
-                    pad_left = (target_w - new_w) // 2
-                    pad_right = target_w - new_w - pad_left
-                    pad_top = 0
-                    pad_bottom = target_h - new_h
-                elif crop_position == "bottom":
-                    pad_left = (target_w - new_w) // 2
-                    pad_right = target_w - new_w - pad_left
-                    pad_top = target_h - new_h
-                    pad_bottom = 0
-                elif crop_position == "left":
-                    pad_left = 0
-                    pad_right = target_w - new_w
-                    pad_top = (target_h - new_h) // 2
-                    pad_bottom = target_h - new_h - pad_top
-                elif crop_position == "right":
-                    pad_left = target_w - new_w
-                    pad_right = 0
-                    pad_top = (target_h - new_h) // 2
-                    pad_bottom = target_h - new_h - pad_top
-                pad_left, pad_right = max(0, pad_left), max(0, pad_right)
-                pad_top, pad_bottom = max(0, pad_top), max(0, pad_bottom)
-
-            width, height = new_w, new_h
-        else:
-            if width == 0:
-                width = W
-            if height == 0:
-                height = H
-
-        if divisible_by > 1:
-            width = width - (width % divisible_by)
-            height = height - (height % divisible_by)
-
-        if keep_proportion == "crop":
-            old_h, old_w = img.shape[-3], img.shape[-2]
-            old_aspect = old_w / old_h
-            new_aspect = width / height
-            if old_aspect > new_aspect:
-                crop_w, crop_h = round(old_h * new_aspect), old_h
-            else:
-                crop_w, crop_h = old_w, round(old_w / new_aspect)
-            if crop_position == "center":
-                x, y = (old_w - crop_w) // 2, (old_h - crop_h) // 2
-            elif crop_position == "top":
-                x, y = (old_w - crop_w) // 2, 0
-            elif crop_position == "bottom":
-                x, y = (old_w - crop_w) // 2, old_h - crop_h
-            elif crop_position == "left":
-                x, y = 0, (old_h - crop_h) // 2
-            elif crop_position == "right":
-                x, y = old_w - crop_w, (old_h - crop_h) // 2
-            img = img.narrow(-2, x, crop_w).narrow(-3, y, crop_h)
-
-        img = common_upscale(img.movedim(-1, 1), width, height, upscale_method, "disabled").movedim(1, -1)
-
-        if keep_proportion == "pad" and (pad_left or pad_right or pad_top or pad_bottom):
-            color = self._parse_color(pad_color, C)
-            padded_h = height + pad_top + pad_bottom
-            padded_w = width + pad_left + pad_right
-            canvas = torch.empty((img.shape[0], padded_h, padded_w, C), dtype=img.dtype, device=img.device)
-            for ch in range(C):
-                canvas[..., ch] = color[ch] if ch < len(color) else 0.0
-            canvas[:, pad_top:pad_top + height, pad_left:pad_left + width, :] = img
-            img = canvas
-
-        img = img.cpu()
-        return (img, img.shape[2], img.shape[1])
+        out = _resize_image_tensor(image, width, height, upscale_method, keep_proportion,
+                                   pad_color, crop_position, divisible_by, device)
+        return (out, out.shape[2], out.shape[1])
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +510,151 @@ class ZNGBAudioCrop:
         return ({"waveform": cropped, "sample_rate": sample_rate},)
 
 
+# ---------------------------------------------------------------------------
+# 8. Video Clip (cut + resize images and align audio, null tolerant)
+# ---------------------------------------------------------------------------
+
+class ZNGBVideoClip:
+    upscale_methods = ["nearest-exact", "bilinear", "area", "bicubic", "lanczos"]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "fps": ("FLOAT", {"default": 30.0, "min": 0.01, "max": 1000.0, "step": 0.01,
+                                  "tooltip": "Frame rate of the input images. Used to map start/end "
+                                             "seconds to frame indices and to align the audio length "
+                                             "to the number of output frames."}),
+                "start": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.001,
+                                    "tooltip": "Clip start in seconds (millisecond precision)."}),
+                "end": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.001,
+                                  "tooltip": "Clip end in seconds (0 or <= start means until the end)."}),
+                "width": ("INT", {"default": 512, "min": 0, "max": MAX_RESOLUTION, "step": 1}),
+                "height": ("INT", {"default": 512, "min": 0, "max": MAX_RESOLUTION, "step": 1}),
+                "upscale_method": (cls.upscale_methods,),
+                "keep_proportion": (["stretch", "resize", "pad", "crop"], {"default": "pad"}),
+                "pad_color": ("STRING", {"default": "0, 0, 0", "tooltip": "Color used for padding (R, G, B, 0-255)."}),
+                "crop_position": (["center", "top", "bottom", "left", "right"], {"default": "center"}),
+                "divisible_by": ("INT", {"default": 1, "min": 0, "max": 512, "step": 1}),
+                "sample_rate": ("INT", {"default": 44100, "min": 1, "max": 384000, "step": 1,
+                                        "tooltip": "Target audio sample rate for the output. Use the "
+                                                   "same value as audio concat multi for later merging."}),
+            },
+            "optional": {
+                "images": ("IMAGE",),
+                "audio": ("AUDIO",),
+                "device": (["cpu", "gpu"],),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "AUDIO")
+    RETURN_NAMES = ("images", "audio")
+    FUNCTION = "clip"
+    CATEGORY = "ZNGBNodes/video"
+    DESCRIPTION = (
+        "Cuts a [start, end] segment from an image batch and resizes it (like resize image), and "
+        "produces matching audio. The audio length is tied to the number of output frames "
+        "(frames / fps) so lip-sync stays aligned for later concatenation.\n"
+        "- images and audio both null => both outputs null.\n"
+        "- images present, audio null => images are output and audio is silence of the same length.\n"
+        "- images null => both outputs null."
+    )
+
+    @staticmethod
+    def _fit_length(waveform, target_len):
+        cur = waveform.shape[-1]
+        if cur == target_len:
+            return waveform
+        if cur > target_len:
+            return waveform[..., :target_len]
+        pad = torch.zeros(waveform.shape[0], waveform.shape[1], target_len - cur,
+                          dtype=waveform.dtype, device=waveform.device)
+        return torch.cat((waveform, pad), dim=-1)
+
+    def clip(self, fps, start, end, width, height, upscale_method, keep_proportion,
+             pad_color, crop_position, divisible_by, sample_rate,
+             images=None, audio=None, device="cpu"):
+        target_sr = int(sample_rate)
+
+        # The clip is driven by images; without frames there is no segment to output.
+        if images is None:
+            return (None, None)
+
+        fps = float(fps) if fps and fps > 0 else 30.0
+        total_frames = images.shape[0]
+
+        start_f = max(0, int(round(start * fps)))
+        start_f = min(start_f, total_frames)
+        if end and end > start:
+            end_f = int(round(end * fps))
+        else:
+            end_f = total_frames
+        end_f = min(max(end_f, start_f), total_frames)
+
+        sel = images[start_f:end_f]
+        actual_frames = sel.shape[0]
+        if actual_frames == 0:
+            return (None, None)
+
+        out_images = _resize_image_tensor(sel, width, height, upscale_method, keep_proportion,
+                                          pad_color, crop_position, divisible_by, device)
+
+        # Tie audio length to the output frame count to keep lip-sync aligned.
+        clip_seconds = actual_frames / fps
+        target_samples = int(round(clip_seconds * target_sr))
+
+        if audio is not None:
+            wf = audio["waveform"]
+            in_sr = int(audio["sample_rate"])
+            a_start = max(0, int(round(start * in_sr)))
+            a_len = int(round(clip_seconds * in_sr))
+            a_end = min(wf.shape[-1], a_start + a_len)
+            seg = wf[..., a_start:a_end]
+            # Pad with silence if the source audio is shorter than the needed segment.
+            if seg.shape[-1] < a_len:
+                pad = torch.zeros(seg.shape[0], seg.shape[1], a_len - seg.shape[-1],
+                                  dtype=seg.dtype, device=seg.device)
+                seg = torch.cat((seg, pad), dim=-1)
+            if in_sr != target_sr:
+                seg = torchaudio.functional.resample(seg, in_sr, target_sr)
+            # Force an exact sample count so frames and audio stay perfectly aligned.
+            seg = self._fit_length(seg, target_samples)
+            out_audio = {"waveform": seg, "sample_rate": target_sr}
+        else:
+            silent = torch.zeros((1, 1, target_samples), dtype=torch.float32)
+            out_audio = {"waveform": silent, "sample_rate": target_sr}
+
+        return (out_images, out_audio)
+
+
+# ---------------------------------------------------------------------------
+# 9. Float (round to 3 decimals, for video clip start/end)
+# ---------------------------------------------------------------------------
+
+class ZNGBFloat:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "value": ("FLOAT", {"default": 0.0, "min": -1.0e9, "max": 1.0e9, "step": 0.0000000001,
+                                    "tooltip": "A float value (up to 10 decimal places). The output "
+                                               "is rounded to 3 decimals (millisecond precision) for "
+                                               "use as video clip start/end."}),
+            }
+        }
+
+    RETURN_TYPES = ("FLOAT",)
+    RETURN_NAMES = ("float",)
+    FUNCTION = "get_value"
+    CATEGORY = "ZNGBNodes/utils"
+    DESCRIPTION = ("A float input node. Accepts up to 10 decimal places and outputs the value "
+                   "rounded to 3 decimals (millisecond precision), meant for the video clip "
+                   "start/end inputs.")
+
+    def get_value(self, value):
+        return (round(float(value), 3),)
+
+
 NODE_CLASS_MAPPINGS = {
     "ZNGB_LoadVideoFromUrl": ZNGBLoadVideoFromUrl,
     "ZNGB_GetVideoComponents": ZNGBGetVideoComponents,
@@ -506,6 +663,8 @@ NODE_CLASS_MAPPINGS = {
     "ZNGB_GetImageRangeFromBatch": ZNGBGetImageRangeFromBatch,
     "ZNGB_ResizeImage": ZNGBResizeImage,
     "ZNGB_AudioCrop": ZNGBAudioCrop,
+    "ZNGB_VideoClip": ZNGBVideoClip,
+    "ZNGB_Float": ZNGBFloat,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -516,4 +675,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ZNGB_GetImageRangeFromBatch": "get image range from batch",
     "ZNGB_ResizeImage": "resize image",
     "ZNGB_AudioCrop": "audio crop",
+    "ZNGB_VideoClip": "video clip",
+    "ZNGB_Float": "float",
 }
