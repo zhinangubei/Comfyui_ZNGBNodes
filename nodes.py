@@ -521,10 +521,16 @@ class ZNGBVideoClip:
     def INPUT_TYPES(cls):
         return {
             "required": {
+                "source_fps": ("FLOAT", {"default": 30.0, "min": 0.01, "max": 1000.0, "step": 0.01,
+                                         "tooltip": "Frame rate of the INPUT images (the original "
+                                                    "video fps, e.g. from get video components). Used "
+                                                    "to map start/end seconds to source frame indices "
+                                                    "and to measure the real duration of the cut."}),
                 "fps": ("FLOAT", {"default": 30.0, "min": 0.01, "max": 1000.0, "step": 0.01,
-                                  "tooltip": "Frame rate of the input images. Used to map start/end "
-                                             "seconds to frame indices and to align the audio length "
-                                             "to the number of output frames."}),
+                                  "tooltip": "OUTPUT/composite frame rate. The selected frames are "
+                                             "retimed (duplicated/dropped) to this fps so the frame "
+                                             "count matches the final video, and the audio is aligned "
+                                             "to that output duration to keep lip-sync."}),
                 "start": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.001,
                                     "tooltip": "Clip start in seconds (millisecond precision)."}),
                 "end": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.001,
@@ -552,9 +558,10 @@ class ZNGBVideoClip:
     FUNCTION = "clip"
     CATEGORY = "ZNGBNodes/video"
     DESCRIPTION = (
-        "Cuts a [start, end] segment from an image batch and resizes it (like resize image), and "
-        "produces matching audio. The audio length is tied to the number of output frames "
-        "(frames / fps) so lip-sync stays aligned for later concatenation.\n"
+        "Cuts a [start, end] segment from an image batch (located by source_fps), resizes it (like "
+        "resize image), then retimes the frames from source_fps to the output fps so the frame count "
+        "matches the composite video. The audio is aligned to that output duration so lip-sync stays "
+        "correct even when the original video fps differs from the composite fps.\n"
         "- images and audio both null => both outputs null.\n"
         "- images present, audio null => images are output and audio is silence of the same length.\n"
         "- images null => both outputs null."
@@ -571,7 +578,7 @@ class ZNGBVideoClip:
                           dtype=waveform.dtype, device=waveform.device)
         return torch.cat((waveform, pad), dim=-1)
 
-    def clip(self, fps, start, end, width, height, upscale_method, keep_proportion,
+    def clip(self, source_fps, fps, start, end, width, height, upscale_method, keep_proportion,
              pad_color, crop_position, divisible_by, sample_rate,
              images=None, audio=None, device="cpu"):
         target_sr = int(sample_rate)
@@ -580,13 +587,15 @@ class ZNGBVideoClip:
         if images is None:
             return (None, None)
 
-        fps = float(fps) if fps and fps > 0 else 30.0
+        src_fps = float(source_fps) if source_fps and source_fps > 0 else 30.0
+        out_fps = float(fps) if fps and fps > 0 else 30.0
         total_frames = images.shape[0]
 
-        start_f = max(0, int(round(start * fps)))
+        # 1. Locate the segment in the SOURCE frames using the original video fps.
+        start_f = max(0, int(round(start * src_fps)))
         start_f = min(start_f, total_frames)
         if end and end > start:
-            end_f = int(round(end * fps))
+            end_f = int(round(end * src_fps))
         else:
             end_f = total_frames
         end_f = min(max(end_f, start_f), total_frames)
@@ -596,12 +605,24 @@ class ZNGBVideoClip:
         if actual_frames == 0:
             return (None, None)
 
+        # Real duration of the selected source frames (measured at the source fps).
+        clip_seconds = actual_frames / src_fps
+
         out_images = _resize_image_tensor(sel, width, height, upscale_method, keep_proportion,
                                           pad_color, crop_position, divisible_by, device)
 
-        # Tie audio length to the output frame count to keep lip-sync aligned.
-        clip_seconds = actual_frames / fps
-        target_samples = int(round(clip_seconds * target_sr))
+        # 2. Retime the frames from source_fps to the output fps so the frame count
+        #    matches the composite timeline. This is what keeps lip-sync aligned when
+        #    the original video fps (e.g. 24) differs from the composite fps (e.g. 30).
+        out_frame_count = max(1, int(round(clip_seconds * out_fps)))
+        if out_frame_count != actual_frames:
+            idx = torch.linspace(0, actual_frames - 1, steps=out_frame_count).round().long()
+            out_images = out_images[idx]
+
+        # 3. Tie the audio length to the OUTPUT video duration (frames / out_fps) so the
+        #    audio and the retimed frames span exactly the same time.
+        out_seconds = out_frame_count / out_fps
+        target_samples = int(round(out_seconds * target_sr))
 
         if audio is not None:
             wf = audio["waveform"]
