@@ -34,6 +34,43 @@ function setupDynamicInputs(node, { type, prefix, countWidget = "inputcount", sl
     return rebuild;
 }
 
+// Audio Overlay Multi: each index needs audio_i + audio_i_start + audio_i_volume.
+function setupOverlayInputs(node, countWidget = "inputcount") {
+    const rebuild = () => {
+        if (!node.inputs) node.inputs = [];
+        const countW = node.widgets?.find((w) => w.name === countWidget);
+        if (!countW) return;
+        const target = countW.value;
+        const current = node.inputs.filter((i) => /^audio_\d+$/.test(i.name || "")).length;
+        if (target === current) return;
+        if (target < current) {
+            for (let i = current; i > target; i--) {
+                for (const suf of ["_volume", "_start", ""]) {
+                    const idx = node.inputs.findIndex((s) => s.name === `audio_${i}${suf}`);
+                    if (idx !== -1) node.removeInput(idx);
+                }
+            }
+        } else {
+            for (let i = current + 1; i <= target; i++) {
+                node.addInput(`audio_${i}`, "AUDIO", { shape: 7 });
+                node.addInput(`audio_${i}_start`, "FLOAT", { shape: 7 });
+                node.addInput(`audio_${i}_volume`, "FLOAT", { shape: 7 });
+            }
+        }
+    };
+    node.addWidget("button", "Update inputs", null, rebuild);
+    const countW = node.widgets?.find((w) => w.name === countWidget);
+    if (countW) {
+        const origCb = countW.callback;
+        countW.callback = function (value, canvas) {
+            const r = origCb ? origCb.apply(this, arguments) : undefined;
+            if (!canvas) rebuild();
+            return r;
+        };
+    }
+    return rebuild;
+}
+
 app.registerExtension({
     name: "ZNGBNodes.dynamicInputs",
     async beforeRegisterNodeDef(nodeType, nodeData) {
@@ -46,6 +83,11 @@ app.registerExtension({
             case "ZNGB_AudioConcatMulti":
                 nodeType.prototype.onNodeCreated = function () {
                     setupDynamicInputs(this, { type: "AUDIO", prefix: "audio_", slotOptions: { shape: 7 } });
+                };
+                break;
+            case "ZNGB_AudioOverlayMulti":
+                nodeType.prototype.onNodeCreated = function () {
+                    setupOverlayInputs(this);
                 };
                 break;
             default:
