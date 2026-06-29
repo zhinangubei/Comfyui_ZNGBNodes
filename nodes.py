@@ -75,6 +75,33 @@ def _download_video(url: str) -> str:
     return dest
 
 
+def _download_audio(url: str) -> str:
+    """Download a remote audio file into the input directory (cached by URL hash)."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"Unsupported URL scheme: {parsed.scheme!r} (only http/https allowed)")
+
+    input_dir = folder_paths.get_input_directory()
+    os.makedirs(input_dir, exist_ok=True)
+
+    ext = os.path.splitext(parsed.path)[1]
+    if not ext or len(ext) > 5:
+        ext = ".mp3"
+
+    name = "zngb_" + hashlib.sha256(url.encode("utf-8")).hexdigest()[:16] + ext
+    dest = os.path.join(input_dir, name)
+
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        return dest
+
+    req = urllib.request.Request(url, headers={"User-Agent": "ComfyUI-ZNGBNodes/1.0"})
+    tmp = dest + ".part"
+    with urllib.request.urlopen(req, timeout=120) as resp, open(tmp, "wb") as f:
+        shutil.copyfileobj(resp, f)
+    os.replace(tmp, dest)
+    return dest
+
+
 def _parse_pad_color(pad_color, channels):
     """Parse a "R, G, B" string into a list of 0-1 floats, broadcast to `channels`."""
     parts = [p.strip() for p in str(pad_color).replace(";", ",").split(",") if p.strip() != ""]
@@ -233,6 +260,40 @@ class ZNGBLoadVideoFromUrl:
     @classmethod
     def IS_CHANGED(cls, url, keep_audio, trim_time):
         return f"{url}|{keep_audio}|{trim_time}"
+
+
+# ---------------------------------------------------------------------------
+# 1b. Load Audio From Url
+# ---------------------------------------------------------------------------
+
+class ZNGBLoadAudioFromUrl:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "url": ("STRING", {"default": "", "multiline": True}),
+            }
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "load"
+    CATEGORY = "ZNGBNodes/audio"
+    DESCRIPTION = "Download an audio file from an http(s) url. If url is empty/None, output is null."
+
+    def load(self, url):
+        if _is_empty_url(url):
+            return (None,)
+
+        path = _download_audio(url.strip())
+        from comfy_extras.nodes_audio import load as _load_audio
+        waveform, sr = _load_audio(path)       # [C, T], float32
+        waveform = waveform.unsqueeze(0)       # [1, C, T]
+        return ({"waveform": waveform, "sample_rate": int(sr)},)
+
+    @classmethod
+    def IS_CHANGED(cls, url):
+        return f"{url}"
 
 
 # ---------------------------------------------------------------------------
@@ -472,9 +533,6 @@ class ZNGBAudioCrop:
                                          "tooltip": "Start position in seconds."}),
                 "duration": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01,
                                        "tooltip": "Length to keep in seconds (0 = until the end)."}),
-                "sample_rate": ("INT", {"default": 44100, "min": 1, "max": 384000, "step": 1,
-                                        "tooltip": "Sample rate used only for the silent audio "
-                                                   "generated when audio is null and duration > 0."}),
             },
             "optional": {
                 "audio": ("AUDIO",),
@@ -486,16 +544,10 @@ class ZNGBAudioCrop:
     FUNCTION = "crop"
     CATEGORY = "ZNGBNodes/audio"
     DESCRIPTION = ("Trims an audio clip by start time and duration (in seconds). "
-                   "If audio is null: when duration > 0 it outputs silent audio of that length, "
-                   "otherwise the output stays null.")
+                   "If audio is null, the output is null.")
 
-    def crop(self, start_time, duration, sample_rate, audio=None):
+    def crop(self, start_time, duration, audio=None):
         if audio is None:
-            # No input audio: only synthesize silence when a positive duration is requested.
-            if duration and duration > 0:
-                num_samples = int(duration * sample_rate)
-                silent = torch.zeros((1, 1, num_samples), dtype=torch.float32)
-                return ({"waveform": silent, "sample_rate": int(sample_rate)},)
             return (None,)
 
         waveform = audio["waveform"]
@@ -510,6 +562,137 @@ class ZNGBAudioCrop:
 
         cropped = waveform[..., start:end]
         return ({"waveform": cropped, "sample_rate": sample_rate},)
+
+
+# ---------------------------------------------------------------------------
+# 7b. Audio Overlay Multi (overlay multiple audios onto a source video timeline)
+# ---------------------------------------------------------------------------
+
+class ZNGBAudioOverlayMulti:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "inputcount": ("INT", {"default": 2, "min": 1, "max": 10, "step": 1}),
+                "source_start": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.001,
+                                           "tooltip": "Crop start of the source video, in seconds."}),
+                "source_end": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.001,
+                                         "tooltip": "Crop end of the source video, in seconds "
+                                                    "(<= start means until the end). Defines the "
+                                                    "output length when the video has no audio."}),
+                "sample_rate": ("INT", {"default": 44100, "min": 1, "max": 384000, "step": 1,
+                                        "tooltip": "Target sample rate for the mixed output."}),
+            },
+            "optional": {
+                "SourceVideo": ("VIDEO",),
+                "audio_1": ("AUDIO",),
+                "audio_1_start": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.001}),
+                "audio_1_volume": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "audio_2": ("AUDIO",),
+                "audio_2_start": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.001}),
+                "audio_2_volume": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "overlay"
+    CATEGORY = "ZNGBNodes/audio"
+    DESCRIPTION = ("Overlays multiple audios onto the source video's timeline. The output length is "
+                   "the cropped source video duration (source_start..source_end). Base track = the "
+                   "video's own audio (cropped) if present, else silence of the same length. Each "
+                   "audio_i is mixed in at audio_i_start with audio_i_volume. If SourceVideo is null "
+                   "the overlays are mixed alone and the length = max(start + audio length); if all "
+                   "audios are also null the output is null. Peaks above 1.0 are normalized.")
+
+    def overlay(self, inputcount, source_start, source_end, sample_rate,
+                SourceVideo=None, **kwargs):
+        target_sr = int(sample_rate)
+
+        # No source video: mix the overlays alone; length = max(start + audio length).
+        if SourceVideo is None:
+            clips = []
+            max_samples = 0
+            for c in range(inputcount):
+                audio = kwargs.get(f"audio_{c + 1}")
+                if audio is None:
+                    continue
+                vol = float(kwargs.get(f"audio_{c + 1}_volume", 1.0))
+                off = float(kwargs.get(f"audio_{c + 1}_start", 0.0))
+                wf = audio["waveform"]
+                in_sr = int(audio["sample_rate"])
+                if in_sr != target_sr:
+                    wf = torchaudio.functional.resample(wf, in_sr, target_sr)
+                offset = max(0, int(round(off * target_sr)))
+                clips.append((wf, offset, vol))
+                max_samples = max(max_samples, offset + wf.shape[-1])
+            if not clips:
+                return (None,)
+            base = torch.zeros((1, 2, max_samples), dtype=torch.float32)
+            for wf, offset, vol in clips:
+                base = self._mix_into(base, wf, offset, vol)
+            peak = base.abs().max()
+            if peak > 1.0:
+                base = base / peak
+            return ({"waveform": base, "sample_rate": target_sr},)
+
+        comps = SourceVideo.get_components()
+        fps = float(comps.frame_rate)
+        total_frames = comps.images.shape[0]
+        video_seconds = total_frames / fps if fps > 0 else 0.0
+
+        start = max(0.0, source_start)
+        end = source_end if source_end and source_end > start else video_seconds
+        clip_seconds = max(0.0, end - start)
+        total = max(1, int(round(clip_seconds * target_sr)))
+
+        # Base track: source audio (cropped) if present, else silence.
+        base = torch.zeros((1, 2, total), dtype=torch.float32)
+        src_audio = comps.audio
+        if src_audio is not None:
+            wf = src_audio["waveform"]
+            in_sr = int(src_audio["sample_rate"])
+            a0 = max(0, int(round(start * in_sr)))
+            a1 = min(wf.shape[-1], int(round(end * in_sr)))
+            seg = wf[..., a0:a1]
+            if in_sr != target_sr:
+                seg = torchaudio.functional.resample(seg, in_sr, target_sr)
+            base = self._mix_into(base, seg, 0, 1.0)
+
+        for c in range(inputcount):
+            audio = kwargs.get(f"audio_{c + 1}")
+            if audio is None:
+                continue
+            vol = float(kwargs.get(f"audio_{c + 1}_volume", 1.0))
+            off = float(kwargs.get(f"audio_{c + 1}_start", 0.0))
+            wf = audio["waveform"]
+            in_sr = int(audio["sample_rate"])
+            if in_sr != target_sr:
+                wf = torchaudio.functional.resample(wf, in_sr, target_sr)
+            base = self._mix_into(base, wf, int(round(off * target_sr)), vol)
+
+        peak = base.abs().max()
+        if peak > 1.0:
+            base = base / peak
+        return ({"waveform": base, "sample_rate": target_sr},)
+
+    @staticmethod
+    def _mix_into(base, seg, offset, volume):
+        # base: [1, 2, T]; seg: [B, C, t] -> mix to stereo at offset.
+        s = seg[0] if seg.dim() == 3 else seg
+        if s.shape[0] == 1:
+            s = s.expand(2, -1)
+        elif s.shape[0] > 2:
+            s = s[:2]
+        elif s.shape[0] == 0:
+            return base
+        t = s.shape[-1]
+        total = base.shape[-1]
+        if offset >= total:
+            return base
+        end = min(total, offset + t)
+        base[0, :, offset:end] += s[:, :end - offset] * volume
+        return base
 
 
 # ---------------------------------------------------------------------------
@@ -566,7 +749,7 @@ class ZNGBVideoClip:
         "correct even when the original video fps differs from the composite fps.\n"
         "- images and audio both null => both outputs null.\n"
         "- images present, audio null => images are output and audio is silence of the same length.\n"
-        "- images null => both outputs null."
+        "- images null, audio present => black frames matching the audio duration + the audio."
     )
 
     @staticmethod
@@ -584,13 +767,30 @@ class ZNGBVideoClip:
              pad_color, crop_position, divisible_by, sample_rate,
              images=None, audio=None, device="cpu"):
         target_sr = int(sample_rate)
+        out_fps = float(fps) if fps and fps > 0 else 30.0
 
-        # The clip is driven by images; without frames there is no segment to output.
-        if images is None:
+        # Both empty: nothing to output.
+        if images is None and audio is None:
             return (None, None)
 
+        # No images but audio present: output black frames matching the audio's
+        # full duration at the output fps, and pass the audio through.
+        if images is None:
+            wf = audio["waveform"]
+            in_sr = int(audio["sample_rate"])
+            total = wf.shape[-1]
+            seg = wf
+            clip_seconds = max(0.0, total / in_sr)
+            out_frame_count = max(1, int(round(clip_seconds * out_fps)))
+            out_seconds = out_frame_count / out_fps
+            target_samples = int(round(out_seconds * target_sr))
+            if in_sr != target_sr:
+                seg = torchaudio.functional.resample(seg, in_sr, target_sr)
+            seg = self._fit_length(seg, target_samples)
+            black = torch.zeros((out_frame_count, height, width, 3), dtype=torch.float32)
+            return (black, {"waveform": seg, "sample_rate": target_sr})
+
         src_fps = float(source_fps) if source_fps and source_fps > 0 else 30.0
-        out_fps = float(fps) if fps and fps > 0 else 30.0
         total_frames = images.shape[0]
 
         # 1. Locate the segment in the SOURCE frames using the original video fps.
@@ -764,9 +964,11 @@ class ZNGBEquirect360ToViews:
 
 NODE_CLASS_MAPPINGS = {
     "ZNGB_LoadVideoFromUrl": ZNGBLoadVideoFromUrl,
+    "ZNGB_LoadAudioFromUrl": ZNGBLoadAudioFromUrl,
     "ZNGB_GetVideoComponents": ZNGBGetVideoComponents,
     "ZNGB_ImageBatchMulti": ZNGBImageBatchMulti,
     "ZNGB_AudioConcatMulti": ZNGBAudioConcatMulti,
+    "ZNGB_AudioOverlayMulti": ZNGBAudioOverlayMulti,
     "ZNGB_GetImageRangeFromBatch": ZNGBGetImageRangeFromBatch,
     "ZNGB_ResizeImage": ZNGBResizeImage,
     "ZNGB_AudioCrop": ZNGBAudioCrop,
@@ -777,9 +979,11 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ZNGB_LoadVideoFromUrl": "load video from url",
+    "ZNGB_LoadAudioFromUrl": "load audio from url",
     "ZNGB_GetVideoComponents": "get video components",
     "ZNGB_ImageBatchMulti": "image batch multi",
     "ZNGB_AudioConcatMulti": "audio concat multi",
+    "ZNGB_AudioOverlayMulti": "audio overlay multi",
     "ZNGB_GetImageRangeFromBatch": "get image range from batch",
     "ZNGB_ResizeImage": "resize image",
     "ZNGB_AudioCrop": "audio crop",
