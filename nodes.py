@@ -9,12 +9,14 @@ rest of a video pipeline can continue and reach a final video combine.
 from __future__ import annotations
 
 import os
+import math
 import shutil
 import hashlib
 import urllib.parse
 import urllib.request
 
 import torch
+import torch.nn.functional as F
 import torchaudio
 
 import folder_paths
@@ -676,6 +678,90 @@ class ZNGBFloat:
         return (round(float(value), 3),)
 
 
+# ---------------------------------------------------------------------------
+# 10. Equirect 360 To Views (extract perspective views from a panorama)
+# ---------------------------------------------------------------------------
+
+class ZNGBEquirect360ToViews:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "num_views": ("INT", {"default": 4, "min": 1, "max": 64, "step": 1,
+                                      "tooltip": "Number of perspective views taken evenly around the "
+                                                 "horizon (yaw). 4 = front/right/back/left."}),
+                "fov": ("FLOAT", {"default": 90.0, "min": 1.0, "max": 179.0, "step": 0.5,
+                                  "tooltip": "Horizontal field of view of each output view, in degrees."}),
+                "pitch": ("FLOAT", {"default": 0.0, "min": -90.0, "max": 90.0, "step": 0.5,
+                                    "tooltip": "Vertical look angle: +up / -down, in degrees."}),
+                "yaw_offset": ("FLOAT", {"default": 0.0, "min": -360.0, "max": 360.0, "step": 0.5,
+                                         "tooltip": "Rotation offset applied to the first view, in degrees."}),
+                "width": ("INT", {"default": 1024, "min": 1, "max": MAX_RESOLUTION, "step": 1}),
+                "height": ("INT", {"default": 1024, "min": 1, "max": MAX_RESOLUTION, "step": 1}),
+            },
+            "optional": {
+                "device": (["cpu", "gpu"],),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("views",)
+    FUNCTION = "extract"
+    CATEGORY = "ZNGBNodes/image"
+    DESCRIPTION = ("Extracts perspective (rectilinear) views from an equirectangular 360 panorama. "
+                   "Produces num_views images evenly spaced around the horizon as one image batch.")
+
+    def extract(self, image, num_views, fov, pitch, yaw_offset, width, height, device="cpu"):
+        if image is None:
+            return (None,)
+
+        dev = model_management.get_torch_device() if device == "gpu" else torch.device("cpu")
+        pano = image.to(dev)  # [B, H, W, C]
+        B = pano.shape[0]
+
+        fov_h = math.radians(fov)
+        f = 0.5 * width / math.tan(fov_h / 2.0)
+
+        # Pixel grid centered at the principal point.
+        ys, xs = torch.meshgrid(
+            torch.arange(height, dtype=torch.float32, device=dev),
+            torch.arange(width, dtype=torch.float32, device=dev),
+            indexing="ij",
+        )
+        x = (xs - (width - 1) / 2.0)
+        y = (ys - (height - 1) / 2.0)
+        z = torch.full_like(x, f)
+        dirs = torch.stack((x, y, z), dim=-1)
+        dirs = dirs / dirs.norm(dim=-1, keepdim=True)  # [H, W, 3]
+
+        pitch_r = math.radians(pitch)
+        cp, sp = math.cos(pitch_r), math.sin(pitch_r)
+        rot_pitch = torch.tensor([[1, 0, 0], [0, cp, -sp], [0, sp, cp]], dtype=torch.float32, device=dev)
+
+        views = []
+        for i in range(num_views):
+            yaw_r = math.radians(yaw_offset + i * 360.0 / num_views)
+            cy, sy = math.cos(yaw_r), math.sin(yaw_r)
+            rot_yaw = torch.tensor([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]], dtype=torch.float32, device=dev)
+            rot = rot_yaw @ rot_pitch
+            d = dirs @ rot.T  # [H, W, 3]
+
+            dx, dy, dz = d[..., 0], d[..., 1], d[..., 2]
+            lon = torch.atan2(dx, dz)            # -pi..pi
+            lat = torch.asin(torch.clamp(dy, -1.0, 1.0))  # -pi/2..pi/2
+            u = lon / math.pi                    # -1..1
+            v = lat / (math.pi / 2.0)            # -1..1
+            grid = torch.stack((u, v), dim=-1).unsqueeze(0).expand(B, -1, -1, -1)
+
+            src = pano.movedim(-1, 1)            # [B, C, H, W]
+            out = F.grid_sample(src, grid, mode="bilinear", padding_mode="border", align_corners=True)
+            views.append(out.movedim(1, -1))     # [B, H, W, C]
+
+        result = torch.cat(views, dim=0) if len(views) > 1 else views[0]
+        return (result.cpu(),)
+
+
 NODE_CLASS_MAPPINGS = {
     "ZNGB_LoadVideoFromUrl": ZNGBLoadVideoFromUrl,
     "ZNGB_GetVideoComponents": ZNGBGetVideoComponents,
@@ -686,6 +772,7 @@ NODE_CLASS_MAPPINGS = {
     "ZNGB_AudioCrop": ZNGBAudioCrop,
     "ZNGB_VideoClip": ZNGBVideoClip,
     "ZNGB_Float": ZNGBFloat,
+    "ZNGB_Equirect360ToViews": ZNGBEquirect360ToViews,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -698,4 +785,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ZNGB_AudioCrop": "audio crop",
     "ZNGB_VideoClip": "video clip",
     "ZNGB_Float": "float",
+    "ZNGB_Equirect360ToViews": "Equirect360ToViews",
 }
