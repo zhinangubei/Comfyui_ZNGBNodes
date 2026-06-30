@@ -851,6 +851,204 @@ class ZNGBVideoClip:
 
 
 # ---------------------------------------------------------------------------
+# 8b. Video Clip V2 (video clip + multi audio overlay, null tolerant)
+# ---------------------------------------------------------------------------
+
+class ZNGBVideoClipV2:
+    upscale_methods = ["nearest-exact", "bilinear", "area", "bicubic", "lanczos"]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "inputcount": ("INT", {"default": 2, "min": 1, "max": 10, "step": 1,
+                                       "tooltip": "Number of overlay audio tracks (audio_i + start "
+                                                  "+ volume). Press 'Update inputs' to apply."}),
+                "source_fps": ("FLOAT", {"default": 30.0, "min": 0.01, "max": 1000.0, "step": 0.01,
+                                         "tooltip": "Frame rate of source_images (the original video "
+                                                    "fps). Maps start/end seconds to source frames."}),
+                "fps": ("FLOAT", {"default": 30.0, "min": 0.01, "max": 1000.0, "step": 0.01,
+                                  "tooltip": "Output/composite frame rate. Frames are retimed to this "
+                                             "fps and audio is aligned to it to keep lip-sync."}),
+                "source_video_start": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.001,
+                                                 "tooltip": "Clip start in seconds (millisecond precision)."}),
+                "source_video_end": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.001,
+                                               "tooltip": "Clip end in seconds (0 or <= start = until the end)."}),
+                "width": ("INT", {"default": 512, "min": 0, "max": MAX_RESOLUTION, "step": 1}),
+                "height": ("INT", {"default": 512, "min": 0, "max": MAX_RESOLUTION, "step": 1}),
+                "upscale_method": (cls.upscale_methods,),
+                "keep_proportion": (["stretch", "resize", "pad", "crop"], {"default": "pad"}),
+                "pad_color": ("STRING", {"default": "0, 0, 0", "tooltip": "Color used for padding (R, G, B, 0-255)."}),
+                "crop_position": (["center", "top", "bottom", "left", "right"], {"default": "center"}),
+                "divisible_by": ("INT", {"default": 1, "min": 0, "max": 512, "step": 1}),
+                "sample_rate": ("INT", {"default": 44100, "min": 1, "max": 384000, "step": 1,
+                                        "tooltip": "Target audio sample rate for the output."}),
+            },
+            "optional": {
+                "source_images": ("IMAGE",),
+                "source_audio": ("AUDIO",),
+                "device": (["cpu", "gpu"],),
+                "audio_1": ("AUDIO",),
+                "audio_1_start": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.001}),
+                "audio_1_volume": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "audio_2": ("AUDIO",),
+                "audio_2_start": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.001}),
+                "audio_2_volume": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "AUDIO")
+    RETURN_NAMES = ("images", "audio")
+    FUNCTION = "clip"
+    CATEGORY = "ZNGBNodes/video"
+    DESCRIPTION = (
+        "Like video clip, but mixes extra background audios on top of the result. Cuts source_images "
+        "[source_video_start, source_video_end] (located by source_fps), resizes and retimes the "
+        "frames to the output fps, then aligns/mixes the audio to that duration so lip-sync stays "
+        "correct. Each audio_i is overlaid at audio_i_start (output timeline) with audio_i_volume.\n"
+        "- source_images & source_audio null, overlays present => base = longest overlay, others mixed "
+        "in at their start; images = black frames matching the mixed audio length.\n"
+        "- source_images present, source_audio null, overlays present => audio = overlays on a silent "
+        "track matching the output video length.\n"
+        "- source_images present, source_audio null, no overlays => the images plus silence of the "
+        "same output duration.\n"
+        "- everything null => both outputs null.\n"
+        "- source_images & source_audio present => standard clip, overlays mixed in if any."
+    )
+
+    @staticmethod
+    def _fit_length(waveform, target_len):
+        cur = waveform.shape[-1]
+        if cur == target_len:
+            return waveform
+        if cur > target_len:
+            return waveform[..., :target_len]
+        pad = torch.zeros(waveform.shape[0], waveform.shape[1], target_len - cur,
+                          dtype=waveform.dtype, device=waveform.device)
+        return torch.cat((waveform, pad), dim=-1)
+
+    def clip(self, inputcount, source_fps, fps, source_video_start, source_video_end,
+             width, height, upscale_method, keep_proportion, pad_color, crop_position,
+             divisible_by, sample_rate, source_images=None, source_audio=None,
+             device="cpu", **kwargs):
+        target_sr = int(sample_rate)
+        out_fps = float(fps) if fps and fps > 0 else 30.0
+        src_fps = float(source_fps) if source_fps and source_fps > 0 else 30.0
+        mix = ZNGBAudioOverlayMulti._mix_into
+
+        # Collect overlay audios (skip the null ones).
+        overlays = []
+        for c in range(inputcount):
+            a = kwargs.get(f"audio_{c + 1}")
+            if a is None:
+                continue
+            vol = float(kwargs.get(f"audio_{c + 1}_volume", 1.0))
+            off = float(kwargs.get(f"audio_{c + 1}_start", 0.0))
+            overlays.append((a, off, vol))
+        has_overlay = len(overlays) > 0
+
+        # ---- Case A: no source video (source_images is null) ----
+        if source_images is None:
+            clips = []
+            max_samples = 0
+            # If a source audio still exists, use it as the base at offset 0.
+            if source_audio is not None:
+                wf = source_audio["waveform"]
+                in_sr = int(source_audio["sample_rate"])
+                if in_sr != target_sr:
+                    wf = torchaudio.functional.resample(wf, in_sr, target_sr)
+                clips.append((wf, 0, 1.0))
+                max_samples = max(max_samples, wf.shape[-1])
+            for a, off, vol in overlays:
+                wf = a["waveform"]
+                in_sr = int(a["sample_rate"])
+                if in_sr != target_sr:
+                    wf = torchaudio.functional.resample(wf, in_sr, target_sr)
+                offset = max(0, int(round(off * target_sr)))
+                clips.append((wf, offset, vol))
+                max_samples = max(max_samples, offset + wf.shape[-1])
+            if not clips:
+                # Everything null => both outputs null.
+                return (None, None)
+            base = torch.zeros((1, 2, max_samples), dtype=torch.float32)
+            for wf, offset, vol in clips:
+                base = mix(base, wf, offset, vol)
+            peak = base.abs().max()
+            if peak > 1.0:
+                base = base / peak
+            audio_seconds = max_samples / target_sr if target_sr > 0 else 0.0
+            out_frame_count = max(1, int(round(audio_seconds * out_fps)))
+            out_seconds = out_frame_count / out_fps
+            base = self._fit_length(base, int(round(out_seconds * target_sr)))
+            black = torch.zeros((out_frame_count, height, width, 3), dtype=torch.float32)
+            return (black, {"waveform": base, "sample_rate": target_sr})
+
+        # ---- Case B: source images present ----
+        total_frames = source_images.shape[0]
+        start = max(0.0, source_video_start)
+        if source_video_end and source_video_end > start:
+            end = source_video_end
+        else:
+            end = total_frames / src_fps
+
+        start_f = min(max(0, int(round(start * src_fps))), total_frames)
+        end_f = min(max(int(round(end * src_fps)), start_f), total_frames)
+        sel = source_images[start_f:end_f]
+        actual_frames = sel.shape[0]
+        if actual_frames == 0:
+            return (None, None)
+
+        clip_seconds = actual_frames / src_fps
+        out_images = _resize_image_tensor(sel, width, height, upscale_method, keep_proportion,
+                                          pad_color, crop_position, divisible_by, device)
+
+        out_frame_count = max(1, int(round(clip_seconds * out_fps)))
+        if out_frame_count != actual_frames:
+            idx = torch.linspace(0, actual_frames - 1, steps=out_frame_count).round().long()
+            out_images = out_images[idx]
+
+        out_seconds = out_frame_count / out_fps
+        target_samples = int(round(out_seconds * target_sr))
+
+        has_source_audio = source_audio is not None
+        # No audio at all: images plus silence of the same output duration.
+        if not has_source_audio and not has_overlay:
+            silent = torch.zeros((1, 1, target_samples), dtype=torch.float32)
+            return (out_images, {"waveform": silent, "sample_rate": target_sr})
+
+        # Base track aligned to the output video duration.
+        base = torch.zeros((1, 2, target_samples), dtype=torch.float32)
+        if has_source_audio:
+            wf = source_audio["waveform"]
+            in_sr = int(source_audio["sample_rate"])
+            a_start = max(0, int(round(start * in_sr)))
+            a_len = int(round(clip_seconds * in_sr))
+            a_end = min(wf.shape[-1], a_start + a_len)
+            seg = wf[..., a_start:a_end]
+            if seg.shape[-1] < a_len:
+                pad = torch.zeros(seg.shape[0], seg.shape[1], a_len - seg.shape[-1],
+                                  dtype=seg.dtype, device=seg.device)
+                seg = torch.cat((seg, pad), dim=-1)
+            if in_sr != target_sr:
+                seg = torchaudio.functional.resample(seg, in_sr, target_sr)
+            seg = self._fit_length(seg, target_samples)
+            base = mix(base, seg, 0, 1.0)
+
+        # Overlay audios at their start (relative to the output clip timeline).
+        for a, off, vol in overlays:
+            wf = a["waveform"]
+            in_sr = int(a["sample_rate"])
+            if in_sr != target_sr:
+                wf = torchaudio.functional.resample(wf, in_sr, target_sr)
+            base = mix(base, wf, max(0, int(round(off * target_sr))), vol)
+
+        peak = base.abs().max()
+        if peak > 1.0:
+            base = base / peak
+        return (out_images, {"waveform": base, "sample_rate": target_sr})
+
+
+# ---------------------------------------------------------------------------
 # 9. Float (round to 3 decimals, for video clip start/end)
 # ---------------------------------------------------------------------------
 
@@ -973,6 +1171,7 @@ NODE_CLASS_MAPPINGS = {
     "ZNGB_ResizeImage": ZNGBResizeImage,
     "ZNGB_AudioCrop": ZNGBAudioCrop,
     "ZNGB_VideoClip": ZNGBVideoClip,
+    "ZNGB_VideoClipV2": ZNGBVideoClipV2,
     "ZNGB_Float": ZNGBFloat,
     "ZNGB_Equirect360ToViews": ZNGBEquirect360ToViews,
 }
@@ -988,6 +1187,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ZNGB_ResizeImage": "resize image",
     "ZNGB_AudioCrop": "audio crop",
     "ZNGB_VideoClip": "video clip",
+    "ZNGB_VideoClipV2": "video clip V2",
     "ZNGB_Float": "float",
     "ZNGB_Equirect360ToViews": "Equirect360ToViews",
 }

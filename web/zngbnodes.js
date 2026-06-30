@@ -90,6 +90,11 @@ app.registerExtension({
                     setupOverlayInputs(this);
                 };
                 break;
+            case "ZNGB_VideoClipV2":
+                nodeType.prototype.onNodeCreated = function () {
+                    setupOverlayInputs(this);
+                };
+                break;
             default:
                 break;
         }
