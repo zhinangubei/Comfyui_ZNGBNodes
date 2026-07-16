@@ -1,0 +1,2 @@
+# 3D 高斯泼溅格式转换 / 压缩工具（提供 3dgsconverter 命令行）。
+git+https://github.com/francescofugazzi/3dgsconverter.git@0.9.0

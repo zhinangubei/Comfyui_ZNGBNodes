@@ -9,9 +9,12 @@ rest of a video pipeline can continue and reach a final video combine.
 from __future__ import annotations
 
 import os
+import sys
 import math
 import shutil
 import hashlib
+import datetime
+import subprocess
 import urllib.parse
 import urllib.request
 
@@ -1160,6 +1163,181 @@ class ZNGBEquirect360ToViews:
         return (result.cpu(),)
 
 
+# ---------------------------------------------------------------------------
+# 14. Gaussian Splatting converter / compressor (ply <-> spz <-> ...)
+# ---------------------------------------------------------------------------
+
+# Target format -> output file extension.
+_GS_FORMAT_EXT = {
+    "spz": ".spz",
+    "3dgs": ".ply",
+    "compressed_ply": ".ply",
+    "cc": ".ply",
+    "ksplat": ".ksplat",
+    "splat": ".splat",
+    "sog": ".sog",
+    "parquet": ".parquet",
+}
+
+
+def _resolve_gsconverter_cmd():
+    """Return the base command list used to launch 3dgsconverter.
+
+    Prefers the console script installed alongside the current Python so we run
+    inside the exact same environment as ComfyUI. Falls back to a module call.
+    Running it as a subprocess keeps Taichi/CUDA initialization out of the
+    ComfyUI process.
+    """
+    exe_dir = os.path.dirname(sys.executable)
+    candidates = []
+    for sub in ("Scripts", "bin", ""):
+        for name in ("3dgsconverter.exe", "3dgsconverter"):
+            candidates.append(os.path.join(exe_dir, sub, name))
+    for p in candidates:
+        if os.path.isfile(p):
+            return [p]
+
+    found = shutil.which("3dgsconverter")
+    if found:
+        return [found]
+
+    # Last resort: invoke the module's main() in the same interpreter.
+    return [sys.executable, "-c", "from gsconverter.main import main; main()"]
+
+
+def _human_size(num_bytes: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if num_bytes < 1024.0:
+            return f"{num_bytes:.2f} {unit}"
+        num_bytes /= 1024.0
+    return f"{num_bytes:.2f} PB"
+
+
+class ZNGBGaussianSplattingConverter:
+    """Convert / losslessly compress a Gaussian Splatting model via 3dgsconverter.
+
+    Loads a model file by path (.ply / .spz / .ksplat / .splat / .sog / .parquet)
+    and writes it out in the chosen target format, returning the saved path. Great
+    for shrinking a large 3DGS .ply (e.g. 381 MB) into a compact .spz.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "input_path": ("STRING", {"default": "", "tooltip": "Path to the source model "
+                                          "(.ply/.spz/.ksplat/.splat/.sog/.parquet)."}),
+                "target_format": (list(_GS_FORMAT_EXT.keys()), {"default": "spz",
+                                  "tooltip": "Output format. 'spz' gives the best lossless size "
+                                             "reduction; 'compressed_ply' is a quantized PLY."}),
+                "compression_level": ("INT", {"default": 9, "min": 0, "max": 9, "step": 1,
+                                      "tooltip": "0-9. For SPZ this is the Gzip (v3) / ZSTD (v4) "
+                                                 "effort and is lossless. 9 = smallest file."}),
+            },
+            "optional": {
+                "spz_version": (["3", "4"], {"default": "3", "tooltip": "SPZ version. 3 = Gzip "
+                                             "(widest support), 4 = ZSTD + native SH4."}),
+                "force": ("BOOLEAN", {"default": True, "tooltip": "Overwrite the output if it exists."}),
+                "rgb": ("BOOLEAN", {"default": False, "tooltip": "Add RGB values derived from SH "
+                                    "(useful for CC/SOG/SPZ viewers)."}),
+                "crop_sh": ("BOOLEAN", {"default": False, "tooltip": "Only write the SH coefficients "
+                            "present in the source (disable canonical SH padding). Prevents a small "
+                            "SH-0 model from ballooning when exporting to '3dgs'/'cc'."}),
+                "extra_elements": ("BOOLEAN", {"default": False, "tooltip": "Preserve extra PLY "
+                                   "elements (camera extrinsic/intrinsic) for 3dgs/cc formats."}),
+                "sh_level": ("INT", {"default": -1, "min": -1, "max": 4, "step": 1,
+                             "tooltip": "Target SH degree 0-4 (-1 = keep source). Lower = smaller."}),
+                "min_opacity": ("INT", {"default": 0, "min": 0, "max": 255, "step": 1,
+                                "tooltip": "Drop splats with opacity below this (0 = keep all). "
+                                           "Note: >0 makes the result lossy."}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("output_path", "info")
+    FUNCTION = "convert"
+    OUTPUT_NODE = True
+    CATEGORY = "ZNGBNodes/3d"
+    DESCRIPTION = ("Convert or losslessly compress a 3D Gaussian Splatting model using "
+                   "3dgsconverter. Input a model path, get the saved path back. Use target "
+                   "'spz' with compression_level 9 to shrink a large .ply with no data loss.")
+
+    @classmethod
+    def IS_CHANGED(cls, input_path, target_format, compression_level,
+                   spz_version="3", force=True, rgb=False, crop_sh=False,
+                   extra_elements=False, sh_level=-1, min_opacity=0):
+        # Always re-run: the output name is timestamped, so every run is unique.
+        return datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+    def convert(self, input_path, target_format, compression_level,
+                spz_version="3", force=True, rgb=False, crop_sh=False,
+                extra_elements=False, sh_level=-1, min_opacity=0):
+        # Null tolerant: an empty path just passes through so a pipeline can continue.
+        if not input_path or not str(input_path).strip():
+            return ("", "no input path provided")
+
+        input_path = str(input_path).strip().strip('"')
+        if not os.path.isfile(input_path):
+            raise FileNotFoundError(f"Input model not found: {input_path!r}")
+
+        # Always save under <ComfyUI output>/3dgsconver/ with a timestamped name.
+        ext = _GS_FORMAT_EXT[target_format]
+        out_dir = os.path.join(folder_paths.get_output_directory(), "3dgsconver")
+        os.makedirs(out_dir, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = os.path.join(out_dir, f"3dgsconver_{stamp}{ext}")
+
+        cmd = _resolve_gsconverter_cmd() + [
+            "-i", input_path,
+            "-f", target_format,
+            "-o", output_path,
+        ]
+        if force:
+            cmd.append("--force")
+        if compression_level is not None and compression_level >= 0:
+            cmd += ["--compression_level", str(compression_level)]
+        if target_format == "spz":
+            cmd += ["--spz_version", str(spz_version)]
+        if rgb:
+            cmd.append("--rgb")
+        if crop_sh:
+            cmd.append("--crop_sh")
+        if extra_elements:
+            cmd.append("--extra_elements")
+        if sh_level is not None and sh_level >= 0:
+            cmd += ["--sh_level", str(sh_level)]
+        if min_opacity and min_opacity > 0:
+            cmd += ["--min_opacity", str(min_opacity)]
+
+        print(f"[ZNGB] 3dgsconverter: {' '.join(cmd)}")
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.stdout:
+            print(proc.stdout)
+        if proc.stderr:
+            print(proc.stderr)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"3dgsconverter failed (exit {proc.returncode}).\n"
+                f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+            )
+        if not os.path.isfile(output_path):
+            raise RuntimeError(
+                f"3dgsconverter reported success but the output was not found: {output_path!r}"
+            )
+
+        in_size = os.path.getsize(input_path)
+        out_size = os.path.getsize(output_path)
+        ratio = (in_size / out_size) if out_size else float("inf")
+        saved_pct = (1.0 - out_size / in_size) * 100.0 if in_size else 0.0
+        info = (
+            f"{os.path.basename(input_path)} ({_human_size(in_size)}) -> "
+            f"{os.path.basename(output_path)} ({_human_size(out_size)})  "
+            f"ratio {ratio:.2f}x, saved {saved_pct:.1f}%\n{output_path}"
+        )
+        print(f"[ZNGB] {info}")
+        return (output_path, info)
+
+
 NODE_CLASS_MAPPINGS = {
     "ZNGB_LoadVideoFromUrl": ZNGBLoadVideoFromUrl,
     "ZNGB_LoadAudioFromUrl": ZNGBLoadAudioFromUrl,
@@ -1174,6 +1352,7 @@ NODE_CLASS_MAPPINGS = {
     "ZNGB_VideoClipV2": ZNGBVideoClipV2,
     "ZNGB_Float": ZNGBFloat,
     "ZNGB_Equirect360ToViews": ZNGBEquirect360ToViews,
+    "ZNGB_GaussianSplattingConverter": ZNGBGaussianSplattingConverter,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1190,4 +1369,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ZNGB_VideoClipV2": "video clip V2",
     "ZNGB_Float": "float",
     "ZNGB_Equirect360ToViews": "Equirect360ToViews",
+    "ZNGB_GaussianSplattingConverter": "gaussian splatting converter (ply/spz)",
 }
