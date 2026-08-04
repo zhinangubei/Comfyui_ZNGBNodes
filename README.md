@@ -21,9 +21,16 @@ pip install -r Comfyui_ZNGBNodes/requirements.txt
 
 重启 ComfyUI 后，节点会出现在 `ZNGBNodes/video`、`ZNGBNodes/image`、`ZNGBNodes/audio`、`ZNGBNodes/utils`、`ZNGBNodes/3d` 分类下。
 
-### OCR 节点迁移
+## 节点说明
 
-`EasyOcr_zngb` 和 `TextMaskSegment_zngb` 已迁移至独立的 `Comfyui_ZNGB_OCR` 节点包；`birefnet_text_segment` 已迁移至 `ComfyUI-EasyOCR`。原包已删除这三个节点的实现和注册。
+### load video from url（`ZNGBNodes/video`）
+
+从 http(s) 链接下载视频并输出 `VIDEO`。
+
+- 输入：`url`(STRING)、`keep_audio`(BOOLEAN)、`trim_time`(FLOAT，秒，0=不裁剪)
+- 输出：`VIDEO`
+- `url` 为空 / `none` / `null` 时，输出 `null`。
+- 下载文件按 URL 哈希缓存到 `input` 目录，重复运行不重复下载；仅允许 http/https。
 
 ### LamaInpainting_zngb（`ZNGBNodes/image`）
 
