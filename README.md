@@ -21,6 +21,29 @@ pip install -r Comfyui_ZNGBNodes/requirements.txt
 
 重启 ComfyUI 后，节点会出现在 `ZNGBNodes/video`、`ZNGBNodes/image`、`ZNGBNodes/audio`、`ZNGBNodes/utils`、`ZNGBNodes/3d` 分类下。
 
+### OCR 节点迁移
+
+`EasyOcr_zngb` 和 `TextMaskSegment_zngb` 已迁移至独立的 `Comfyui_ZNGB_OCR` 节点包；`birefnet_text_segment` 已迁移至 `ComfyUI-EasyOCR`。原包已删除这三个节点的实现和注册。
+
+### LamaInpainting_zngb（`ZNGBNodes/image`）
+
+使用本地 ModelScope `iic/cv_fft_inpainting_lama` 模型修复蒙版区域。
+
+- 模型目录固定为 `ComfyUI/models/cv_fft_inpainting_lama`，其中必须包含 `pytorch_model.pt`。
+- 输入：`img`（`IMAGE`）和 `mask`（`MASK`）；任何大于 0 的蒙版像素都会作为修复区域。
+- 输出：与输入图像批次和尺寸相同的 `image`，蒙版外像素保持原值。
+- 单张 mask 可广播到整批图像；mask 尺寸不同时会使用最近邻插值对齐图像。
+- 模型自动使用 ComfyUI 当前推理设备并在首次加载后缓存。图像和蒙版会按官方普通推理逻辑对称补到 8 的倍数，再裁回原尺寸。
+
+### crop image by bboxes（`ZNGBNodes/image`）
+
+根据 `Qwen2.5-VL Object Detection` 输出的 `BBOX` 列表裁剪原图。
+
+- 输入：`bboxes`（`BBOX`）和 `image`（`IMAGE`）。
+- 输出：`imgs_list`，每个检测框对应一个独立的 ComfyUI `IMAGE` 列表项，可保留不同裁剪尺寸。
+- 坐标格式为 `[x1, y1, x2, y2]`；越界坐标会裁到图像边界，反向坐标会自动纠正，无效框会跳过。
+- 图像为 batch 时，每张图都会应用全部检测框，输出顺序为先图像、后检测框。
+
 
 ## 节点列表
 
@@ -140,6 +163,22 @@ pip install -r Comfyui_ZNGBNodes/requirements.txt
   - `device`(可选，`cpu`/`gpu`)：采样计算设备
 - 输出：`views`(IMAGE，`num_views` 张图组成的 batch)
 - `image` 为空时输出 `null`。
+
+### 12. lens distortion correction (OpenCV)（`ZNGBNodes/image`）
+使用 OpenCV Brown-Conrady 相机模型校正稳定的径向和切向畸变。它不会改变目标 FOV，和直接降低
+`Equirect360ToViews.fov` 不同，而是对离图像中心距离不同的像素施加不同强度的非线性重映射。
+
+- 输入：
+  - `images`(IMAGE)：`Equirect360ToViews` 输出的单张图或 batch
+  - `source_horizontal_fov`(FLOAT)：必须与 `Equirect360ToViews.fov` 一致
+  - `k1 / k2 / k3`：径向畸变系数；先只调 `k1`，不够时再小幅调 `k2`，通常保持 `k3=0`
+  - `p1 / p2`：切向畸变系数，只有畸变明显不对称时才调整
+  - `center_x / center_y`：归一化畸变中心，默认 `(0.5, 0.5)`
+  - `zoom`：校正后的裁边倍率，默认 `1.0`，边缘不理想时再增大
+- 输出：`images`(IMAGE)，分辨率和 batch 数量保持不变
+- 桶形畸变一般从负 `k1` 开始尝试，例如 `-0.05`、`-0.10`、`-0.20`；若弯曲加重则改用正值。
+- 同一张 AI 全景图导出的全部视角必须共享同一组参数，不能逐张自动拟合，否则会破坏 3DGS 所需的多视图一致性。
+- 该节点只能修复符合统一相机模型的规律性弯曲，不能恢复 AI 生成的局部家具变形、重复物体、断裂接缝或空间结构错误。
 
 ## 典型用法
 

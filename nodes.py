@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import sys
 import math
+import json
 import shutil
 import hashlib
 import datetime
@@ -18,6 +19,8 @@ import subprocess
 import urllib.parse
 import urllib.request
 
+import cv2
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torchaudio
@@ -29,6 +32,9 @@ from comfy_api.latest import InputImpl, Types
 
 
 MAX_RESOLUTION = 16384
+
+_LAMA_INPAINT_MODEL = None
+_LAMA_INPAINT_MODEL_DEVICE = None
 
 
 # ---------------------------------------------------------------------------
@@ -1164,6 +1170,98 @@ class ZNGBEquirect360ToViews:
 
 
 # ---------------------------------------------------------------------------
+# 11. Lens Distortion Correction (OpenCV Brown-Conrady camera model)
+# ---------------------------------------------------------------------------
+
+class ZNGBLensDistortionCorrection:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "source_horizontal_fov": ("FLOAT", {
+                    "default": 90.0, "min": 1.0, "max": 179.0, "step": 0.5,
+                    "tooltip": "Horizontal FOV used by Equirect360ToViews.",
+                }),
+                "k1": ("FLOAT", {
+                    "default": 0.0, "min": -2.0, "max": 2.0, "step": 0.001,
+                    "tooltip": "Primary radial coefficient. Start here; barrel distortion usually needs a negative value.",
+                }),
+                "k2": ("FLOAT", {
+                    "default": 0.0, "min": -2.0, "max": 2.0, "step": 0.001,
+                    "tooltip": "Secondary radial coefficient. Keep at 0 until k1 alone is insufficient.",
+                }),
+                "k3": ("FLOAT", {
+                    "default": 0.0, "min": -2.0, "max": 2.0, "step": 0.001,
+                    "tooltip": "Third radial coefficient for strong edge distortion.",
+                }),
+                "p1": ("FLOAT", {
+                    "default": 0.0, "min": -0.5, "max": 0.5, "step": 0.0005,
+                    "tooltip": "Vertical tangential coefficient. Normally leave at 0.",
+                }),
+                "p2": ("FLOAT", {
+                    "default": 0.0, "min": -0.5, "max": 0.5, "step": 0.0005,
+                    "tooltip": "Horizontal tangential coefficient. Normally leave at 0.",
+                }),
+                "center_x": ("FLOAT", {
+                    "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.001,
+                    "tooltip": "Normalized distortion center X. 0.5 is the image center.",
+                }),
+                "center_y": ("FLOAT", {
+                    "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.001,
+                    "tooltip": "Normalized distortion center Y. 0.5 is the image center.",
+                }),
+                "zoom": ("FLOAT", {
+                    "default": 1.0, "min": 0.1, "max": 3.0, "step": 0.01,
+                    "tooltip": "Output zoom. Increase only to crop invalid borders after correction.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "correct"
+    CATEGORY = "ZNGBNodes/image"
+    DESCRIPTION = (
+        "Corrects consistent radial and tangential distortion with OpenCV's Brown-Conrady camera "
+        "model. Unlike changing FOV, this bends pixels non-linearly to straighten curved lines. "
+        "Use one shared parameter set for every view from the same AI panorama."
+    )
+
+    def correct(self, images, source_horizontal_fov, k1, k2, k3, p1, p2,
+                center_x, center_y, zoom):
+        if images is None:
+            return (None,)
+
+        try:
+            import cv2
+            import numpy as np
+        except ImportError as exc:
+            raise RuntimeError("lens distortion correction requires opencv-python") from exc
+
+        source = images.detach().cpu().float().numpy()
+        _, height, width, _ = source.shape
+        focal = 0.5 * width / math.tan(math.radians(source_horizontal_fov) / 2.0)
+        camera = np.array([
+            [focal, 0.0, center_x * (width - 1)],
+            [0.0, focal, center_y * (height - 1)],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float64)
+        output_camera = camera.copy()
+        output_camera[0, 0] *= zoom
+        output_camera[1, 1] *= zoom
+        distortion = np.array([k1, k2, p1, p2, k3], dtype=np.float64)
+        map_x, map_y = cv2.initUndistortRectifyMap(
+            camera, distortion, None, output_camera, (width, height), cv2.CV_32FC1,
+        )
+        corrected = [
+            cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+            for frame in source
+        ]
+        return (torch.from_numpy(np.stack(corrected)).clamp_(0.0, 1.0),)
+
+
+# ---------------------------------------------------------------------------
 # 14. Gaussian Splatting converter / compressor (ply <-> spz <-> ...)
 # ---------------------------------------------------------------------------
 
@@ -1211,6 +1309,139 @@ def _human_size(num_bytes: float) -> str:
             return f"{num_bytes:.2f} {unit}"
         num_bytes /= 1024.0
     return f"{num_bytes:.2f} PB"
+
+
+def _get_lama_inpaint_model(device):
+    global _LAMA_INPAINT_MODEL, _LAMA_INPAINT_MODEL_DEVICE
+
+    model_path = os.path.join(folder_paths.models_dir, "cv_fft_inpainting_lama")
+    model_file = os.path.join(model_path, "pytorch_model.pt")
+    if not os.path.isfile(model_file):
+        raise FileNotFoundError(
+            f"LaMa model not found at {model_path!r}; pytorch_model.pt is required"
+        )
+
+    if _LAMA_INPAINT_MODEL is None:
+        from modelscope.models.cv.image_inpainting.model import FFTInpainting
+
+        _LAMA_INPAINT_MODEL = FFTInpainting(
+            model_path, predict_only=True
+        ).eval()
+    if _LAMA_INPAINT_MODEL_DEVICE != str(device):
+        _LAMA_INPAINT_MODEL.to(device=device, dtype=torch.float32)
+        _LAMA_INPAINT_MODEL_DEVICE = str(device)
+    return _LAMA_INPAINT_MODEL
+
+
+class LamaInpainting_zngb:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "img": ("IMAGE",),
+                "mask": ("MASK",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "inpaint"
+    CATEGORY = "ZNGBNodes/image"
+
+    def inpaint(self, img, mask):
+        if img.shape[0] != mask.shape[0] and mask.shape[0] != 1:
+            raise ValueError(
+                "mask batch size must be 1 or match the image batch size"
+            )
+
+        device = model_management.get_torch_device()
+        model = _get_lama_inpaint_model(device)
+        outputs = []
+
+        for image_index, item in enumerate(img):
+            source = item[:, :, :3].detach().cpu().float().clamp(0.0, 1.0)
+            source_height, source_width = source.shape[:2]
+            current_mask = mask[0 if mask.shape[0] == 1 else image_index]
+            current_mask = current_mask.detach().cpu().float().unsqueeze(0).unsqueeze(0)
+            if current_mask.shape[-2:] != (source_height, source_width):
+                current_mask = F.interpolate(
+                    current_mask,
+                    size=(source_height, source_width),
+                    mode="nearest",
+                )
+            current_mask = current_mask[0, 0] > 0
+
+            pad_height = (-source_height) % 8
+            pad_width = (-source_width) % 8
+            image_array = source.permute(2, 0, 1).numpy()
+            mask_array = current_mask.numpy().astype(np.float32)[None, ...]
+            image_array = np.pad(
+                image_array,
+                ((0, 0), (0, pad_height), (0, pad_width)),
+                mode="symmetric",
+            )
+            mask_array = np.pad(
+                mask_array,
+                ((0, 0), (0, pad_height), (0, pad_width)),
+                mode="symmetric",
+            )
+            batch = {
+                "image": torch.from_numpy(image_array).unsqueeze(0).to(device),
+                "mask": torch.from_numpy(mask_array).unsqueeze(0).to(device),
+            }
+
+            with torch.inference_mode():
+                result = model(batch)["inpainted"]
+            result = result[0, :, :source_height, :source_width]
+            outputs.append(
+                result.permute(1, 2, 0).detach().float().cpu().clamp(0.0, 1.0).unsqueeze(0)
+            )
+
+        return (torch.cat(outputs, dim=0),)
+
+
+class CropImageByBBoxes:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "bboxes": ("BBOX",),
+                "image": ("IMAGE",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("imgs_list",)
+    OUTPUT_IS_LIST = (True,)
+    FUNCTION = "crop"
+    CATEGORY = "ZNGBNodes/image"
+
+    def crop(self, bboxes, image):
+        if not isinstance(bboxes, (list, tuple)):
+            raise TypeError("bboxes must be a list of [x1, y1, x2, y2] boxes")
+
+        crops = []
+        for item in image:
+            height, width = item.shape[:2]
+            for box in bboxes:
+                if isinstance(box, dict):
+                    box = box.get("bbox_2d") or box.get("bbox")
+                if not isinstance(box, (list, tuple)) or len(box) < 4:
+                    continue
+
+                x1, y1, x2, y2 = (float(value) for value in box[:4])
+                left = max(0, min(width, int(math.floor(min(x1, x2)))))
+                top = max(0, min(height, int(math.floor(min(y1, y2)))))
+                right = max(0, min(width, int(math.ceil(max(x1, x2)))))
+                bottom = max(0, min(height, int(math.ceil(max(y1, y2)))))
+                if right <= left or bottom <= top:
+                    continue
+
+                crops.append(item[top:bottom, left:right, :].unsqueeze(0))
+
+        if not crops:
+            raise ValueError("No valid bounding boxes overlap the input image")
+        return (crops,)
 
 
 class ZNGBGaussianSplattingConverter:
@@ -1339,6 +1570,8 @@ class ZNGBGaussianSplattingConverter:
 
 
 NODE_CLASS_MAPPINGS = {
+    "LamaInpainting_zngb": LamaInpainting_zngb,
+    "CropImageByBBoxes_zngb": CropImageByBBoxes,
     "ZNGB_LoadVideoFromUrl": ZNGBLoadVideoFromUrl,
     "ZNGB_LoadAudioFromUrl": ZNGBLoadAudioFromUrl,
     "ZNGB_GetVideoComponents": ZNGBGetVideoComponents,
@@ -1352,10 +1585,13 @@ NODE_CLASS_MAPPINGS = {
     "ZNGB_VideoClipV2": ZNGBVideoClipV2,
     "ZNGB_Float": ZNGBFloat,
     "ZNGB_Equirect360ToViews": ZNGBEquirect360ToViews,
+    "ZNGB_LensDistortionCorrection": ZNGBLensDistortionCorrection,
     "ZNGB_GaussianSplattingConverter": ZNGBGaussianSplattingConverter,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "LamaInpainting_zngb": "LamaInpainting_zngb",
+    "CropImageByBBoxes_zngb": "crop image by bboxes",
     "ZNGB_LoadVideoFromUrl": "load video from url",
     "ZNGB_LoadAudioFromUrl": "load audio from url",
     "ZNGB_GetVideoComponents": "get video components",
@@ -1369,5 +1605,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ZNGB_VideoClipV2": "video clip V2",
     "ZNGB_Float": "float",
     "ZNGB_Equirect360ToViews": "Equirect360ToViews",
+    "ZNGB_LensDistortionCorrection": "lens distortion correction (OpenCV)",
     "ZNGB_GaussianSplattingConverter": "gaussian splatting converter (ply/spz)",
 }
