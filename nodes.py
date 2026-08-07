@@ -530,6 +530,64 @@ class ZNGBResizeImage:
 
 
 # ---------------------------------------------------------------------------
+# 6b. Image Padding
+# ---------------------------------------------------------------------------
+
+class ZNGBImagePadding:
+    @classmethod
+    def INPUT_TYPES(cls):
+        padding = {"default": 0, "min": 0, "max": MAX_RESOLUTION, "step": 1}
+        color = {"default": 255, "min": 0, "max": 255, "step": 1}
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "padding_left": ("INT", padding),
+                "padding_right": ("INT", padding),
+                "padding_top": ("INT", padding),
+                "padding_bottom": ("INT", padding),
+                "red": ("INT", color),
+                "green": ("INT", color),
+                "blue": ("INT", color),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("image", "mask")
+    FUNCTION = "pad"
+    CATEGORY = "ZNGBNodes/image"
+    DESCRIPTION = "Pads an image and returns a mask where the added area is 1."
+
+    def pad(self, image, padding_left, padding_right, padding_top,
+            padding_bottom, red, green, blue):
+        batch, height, width, channels = image.shape
+        output_height = height + padding_top + padding_bottom
+        output_width = width + padding_left + padding_right
+        output = torch.empty(
+            (batch, output_height, output_width, channels),
+            dtype=image.dtype,
+            device=image.device,
+        )
+        color = (red / 255.0, green / 255.0, blue / 255.0)
+        for channel in range(channels):
+            output[..., channel] = color[channel] if channel < 3 else 1.0
+        output[
+            :, padding_top:padding_top + height,
+            padding_left:padding_left + width, :,
+        ] = image
+
+        mask = torch.ones(
+            (batch, output_height, output_width),
+            dtype=torch.float32,
+            device=image.device,
+        )
+        mask[
+            :, padding_top:padding_top + height,
+            padding_left:padding_left + width,
+        ] = 0.0
+        return (output, mask)
+
+
+# ---------------------------------------------------------------------------
 # 7. Audio Crop (null tolerant)
 # ---------------------------------------------------------------------------
 
@@ -1444,6 +1502,115 @@ class CropImageByBBoxes:
         return (crops,)
 
 
+class CropImgByBBoxes:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "bboxes": ("BOUNDING_BOX",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("imgs_list",)
+    OUTPUT_IS_LIST = (True,)
+    FUNCTION = "crop"
+    CATEGORY = "ZNGBNodes/image"
+    DESCRIPTION = ("Crops each official ComfyUI BBOX as a separate image without resizing. "
+                   "BBoxes use per-frame lists of x/y/width/height dictionaries.")
+
+    def crop(self, image, bboxes):
+        if isinstance(bboxes, dict):
+            bboxes = [[bboxes]]
+        elif isinstance(bboxes, list) and bboxes and isinstance(bboxes[0], dict):
+            bboxes = [bboxes]
+        elif not isinstance(bboxes, list):
+            raise TypeError("bboxes must be a dict, list of dicts, or per-frame list of dicts")
+
+        crops = []
+        for frame_index, item in enumerate(image):
+            if not bboxes:
+                break
+            frame_bboxes = bboxes[min(frame_index, len(bboxes) - 1)]
+            if not isinstance(frame_bboxes, list):
+                raise TypeError("each frame's bboxes must be a list of dictionaries")
+
+            height, width = item.shape[:2]
+            for box in frame_bboxes:
+                if not isinstance(box, dict):
+                    raise TypeError("each bbox must be a dictionary with x, y, width, and height")
+                try:
+                    x = float(box["x"])
+                    y = float(box["y"])
+                    box_width = float(box["width"])
+                    box_height = float(box["height"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "each bbox must contain numeric x, y, width, and height values"
+                    ) from exc
+
+                left = max(0, min(width, int(math.floor(x))))
+                top = max(0, min(height, int(math.floor(y))))
+                right = max(0, min(width, int(math.ceil(x + box_width))))
+                bottom = max(0, min(height, int(math.ceil(y + box_height))))
+                if right <= left or bottom <= top:
+                    continue
+                crops.append(item[top:bottom, left:right, :].unsqueeze(0))
+
+        if not crops:
+            raise ValueError("No valid bounding boxes overlap the input image")
+        return (crops,)
+
+
+class ImageAddMasks:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "masks": ("MASK",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image_list",)
+    OUTPUT_IS_LIST = (True,)
+    FUNCTION = "add_masks"
+    CATEGORY = "ZNGBNodes/image"
+    DESCRIPTION = ("Adds each SAM3 individual mask to the same source image as an alpha channel "
+                   "and returns one RGBA image per mask.")
+
+    def add_masks(self, image, masks):
+        if image is None or len(image) == 0:
+            raise ValueError("image must contain at least one image")
+        if masks is None:
+            raise ValueError("masks cannot be null")
+
+        if masks.dim() == 2:
+            masks = masks.unsqueeze(0)
+        if masks.dim() != 3:
+            raise ValueError("masks must have shape [N, H, W] or [H, W]")
+        if masks.shape[0] == 0:
+            raise ValueError("masks must contain at least one mask")
+
+        source = image[0, :, :, :3]
+        height, width = source.shape[:2]
+        resized_masks = masks.to(device=source.device, dtype=source.dtype)
+        if resized_masks.shape[-2:] != (height, width):
+            resized_masks = F.interpolate(
+                resized_masks.unsqueeze(1),
+                size=(height, width),
+                mode="nearest",
+            ).squeeze(1)
+
+        outputs = []
+        for mask in resized_masks:
+            rgba = torch.cat((source, mask.clamp(0.0, 1.0).unsqueeze(-1)), dim=-1)
+            outputs.append(rgba.unsqueeze(0))
+        return (outputs,)
+
+
 class ZNGBGaussianSplattingConverter:
     """Convert / losslessly compress a Gaussian Splatting model via 3dgsconverter.
 
@@ -1572,6 +1739,8 @@ class ZNGBGaussianSplattingConverter:
 NODE_CLASS_MAPPINGS = {
     "LamaInpainting_zngb": LamaInpainting_zngb,
     "CropImageByBBoxes_zngb": CropImageByBBoxes,
+    "CropImgByBBoxes_zngb": CropImgByBBoxes,
+    "ImageAddMasks_zngb": ImageAddMasks,
     "ZNGB_LoadVideoFromUrl": ZNGBLoadVideoFromUrl,
     "ZNGB_LoadAudioFromUrl": ZNGBLoadAudioFromUrl,
     "ZNGB_GetVideoComponents": ZNGBGetVideoComponents,
@@ -1580,6 +1749,7 @@ NODE_CLASS_MAPPINGS = {
     "ZNGB_AudioOverlayMulti": ZNGBAudioOverlayMulti,
     "ZNGB_GetImageRangeFromBatch": ZNGBGetImageRangeFromBatch,
     "ZNGB_ResizeImage": ZNGBResizeImage,
+    "ZNGB_ImagePadding": ZNGBImagePadding,
     "ZNGB_AudioCrop": ZNGBAudioCrop,
     "ZNGB_VideoClip": ZNGBVideoClip,
     "ZNGB_VideoClipV2": ZNGBVideoClipV2,
@@ -1592,6 +1762,8 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LamaInpainting_zngb": "LamaInpainting_zngb",
     "CropImageByBBoxes_zngb": "crop image by bboxes",
+    "CropImgByBBoxes_zngb": "crop img by bboxes",
+    "ImageAddMasks_zngb": "Image add Masks",
     "ZNGB_LoadVideoFromUrl": "load video from url",
     "ZNGB_LoadAudioFromUrl": "load audio from url",
     "ZNGB_GetVideoComponents": "get video components",
@@ -1600,6 +1772,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ZNGB_AudioOverlayMulti": "audio overlay multi",
     "ZNGB_GetImageRangeFromBatch": "get image range from batch",
     "ZNGB_ResizeImage": "resize image",
+    "ZNGB_ImagePadding": "image padding",
     "ZNGB_AudioCrop": "audio crop",
     "ZNGB_VideoClip": "video clip",
     "ZNGB_VideoClipV2": "video clip V2",

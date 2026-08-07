@@ -101,6 +101,16 @@ pip install -r Comfyui_ZNGBNodes/requirements.txt
 - `image` 为空时，三个输出均为 `null`。
 - `keep_proportion` 支持 `stretch / resize / pad / crop`。
 
+### image padding（`ZNGBNodes/image`）
+为图像四边增加指定像素数的纯色区域，并同时生成外扩区域蒙版。
+
+- 输入：`image`、`padding_left`、`padding_right`、`padding_top`、`padding_bottom`、`red`、`green`、`blue`。
+- 四个 padding 参数均为整数，步进 1；设为 0 表示对应边不扩展。
+- `red / green / blue` 范围为 0–255，默认生成白色填充区域。
+- 输出：扩展后的 `image` 和同尺寸 `mask`。
+- `mask` 中原图区域为 0，新增外扩区域为 1，可直接用于修复、合成等后续节点。
+- 支持图像 batch；每张图使用相同的 padding 和填充颜色。
+
 ### 7. audio crop（`ZNGBNodes/audio`）
 按起始时间和时长裁剪音频（单位：秒）。
 
