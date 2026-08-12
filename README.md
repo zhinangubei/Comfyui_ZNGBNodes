@@ -21,6 +21,23 @@ pip install -r Comfyui_ZNGBNodes/requirements.txt
 
 重启 ComfyUI 后，节点会出现在 `ZNGBNodes/video`、`ZNGBNodes/image`、`ZNGBNodes/audio`、`ZNGBNodes/utils`、`ZNGBNodes/3d` 分类下。
 
+## Qwen LLM API
+
+节点位于 `ZNGBNodes/LLM` 分类下：
+
+- **LLM config**：配置阿里云百炼 OpenAI 兼容接口的 `base_url` 和 API Key。API Key 留空时读取环境变量 `DASHSCOPE_API_KEY`。
+- **qwen LLM API ZNGB**：调用 Qwen Chat Completions API，只输出 `response`（最终回复）。支持 8 路可选 `IMAGE` 输入；每个输入 batch 中的图片都会以 PNG Data URL 发送。
+
+`model` 使用下拉预设，可选择 `qwen3.8-max`、`qwen3.7-plus`（默认）、`qwen3.7-flash` 或 `custom`。选择 `custom` 时，在 `custom_model_id` 中填写业务空间可用的完整模型 ID；选择其他预设时该输入框会被忽略。接入图像时应选择业务空间中支持视觉输入的模型。`thinking_budget` 默认为 `1024`，必须小于 `max_completion_tokens`，以免思考过程耗尽完整输出额度后没有最终回答；旧工作流中的 `0` 会自动按 `1024` 处理。`vl_high_resolution_images` 可提高视觉模型的输入像素上限。接口使用 `stream=false` 非流式请求，一次性返回最终结果，不输出思考过程。
+
+推荐通过环境变量配置密钥，避免将密钥保存在工作流 JSON 中：
+
+```powershell
+$env:DASHSCOPE_API_KEY = "sk-xxx"
+```
+
+`base_url` 应填写到 `/compatible-mode/v1`，不要追加 `/chat/completions`。默认值为当前业务空间专属北京地域地址。
+
 ## 节点说明
 
 ### load video from url（`ZNGBNodes/video`）
@@ -111,6 +128,48 @@ pip install -r Comfyui_ZNGBNodes/requirements.txt
 - `mask` 中原图区域为 0，新增外扩区域为 1，可直接用于修复、合成等后续节点。
 - 支持图像 batch；每张图使用相同的 padding 和填充颜色。
 
+### checkerboard to element masks（`ZNGBNodes/image`）
+
+从浅色棋盘格背景图中提取互不相连的前景元素。
+
+- 输入：`image`（`IMAGE`）；输出：`masks`（`MASK` batch），每个连通域对应一张 mask。
+- 输入包含有效 Alpha 时直接按 Alpha 连通域拆分，并保留软透明边缘。
+- 输入不含 Alpha 时自动估计两种浅色中性棋盘格颜色，只移除与图像边界连通的背景，再按面积过滤微小噪声。
+- 相互接触或重叠的物件会作为同一个 mask 输出；该节点不进行语义分割或遮挡区域补全。
+
+### masks to mask（`ZNGBNodes/image`）
+
+将 SAM3 `individual_masks=true` 输出的一个或多个 `MASK` batch 全部合并为一张联合 mask。
+
+- 输入：`masks`（一个或多个 `MASK` batch，每批形状为 `[N,H,W]`）。
+- 输出：`mask`（单张 `MASK`，形状为 `[1,H,W]`）。
+- 节点会一次接收完整 MASK 列表，不会被 ComfyUI 按列表项重复执行；无论输入多少个 batch，最终只输出一张 mask。
+- 使用逐像素最大值合并，保留软边缘，重叠区域不会因相加而溢出。
+- 已经是单张 `[H,W]` 或 `[1,H,W]` 的 mask 也可以直接输入。
+
+### Mask Fill Hole（`ZNGBNodes/image`）
+
+填充每张 mask 白色区域内部完全封闭的黑色孔洞。
+
+- 输入：`mask`（`MASK` batch）和 `invert_mask`（默认 `false`）。
+- 使用约 `0.5` 的阈值将输入二值化，并采用二维 8 连通规则识别封闭孔洞。
+- 与画布边缘连通的黑色背景不会被填充。
+- `invert_mask=true` 时，在填孔完成后反转输出。
+- 输出为与输入 batch 数量和尺寸一致的二值 `MASK`；软边缘会被二值化。
+
+### checkerboard to element bboxes (SAM3)（`ZNGBNodes/image`）
+
+使用与 `checkerboard to element masks` 相同的棋盘格清理和连通域规则，输出每个独立元素的边界框。
+
+- 输入：`image`（`IMAGE`）；输出：`bboxes`（官方 `BOUNDING_BOX` 类型）。
+- `padding_ratio` 默认 `0.08`，将稳健框向外扩展 8%，为 SAM3 保留目标边缘上下文。
+- `outlier_percent` 默认 `0.5`，计算框时忽略四边少量离群前景像素；设为 `0` 可关闭。
+- `min_area_ratio` 默认 `0.0002`，过滤相对整图面积过小的噪声连通域。
+- 输出采用 SAM3 Detect 所需的逐帧 `x / y / width / height` 字典列表，可直接连接其 `bboxes` 输入。
+- 背景扩张受棋盘格色差约束，避免白色、浅灰色商品被误删；完全位于较大主体内部的断裂碎片不会重复输出框。
+- 每帧的框按元素面积从大到小排列；图像 batch 会保留逐帧结构。
+- 相互接触或重叠的物件会得到同一个框。
+
 ### 7. audio crop（`ZNGBNodes/audio`）
 按起始时间和时长裁剪音频（单位：秒）。
 
@@ -144,6 +203,20 @@ pip install -r Comfyui_ZNGBNodes/requirements.txt
 - 输入：`value`(FLOAT，步进 0.0000000001，可输入小数点后 10 位)
 - 输出：`float`(FLOAT)
 - 输出会自动 `round` 到 **3 位小数**（毫秒精度）。
+
+### text2textlist ZNGB（`ZNGBNodes/utils`）
+
+按指定分隔符把一段文本拆成 ComfyUI `STRING` 列表。
+
+- `text`：待拆分的多行文本。
+- `delimiter`：分隔符，默认 `\n`；支持输入 `\n`、`\r`、`\t` 和 `\\` 转义符，也支持直接输入普通字符。
+- `strip_whitespace`：移除每个列表项首尾的空白字符。
+- `remove_empty`：移除空字符串列表项；通常可与 `strip_whitespace` 一起开启。
+- 分隔符为空时，整段文本作为一个列表项输出。
+
+### text（`ZNGBNodes/utils`）
+
+多行文本输入节点，将 `text` 内容原样输出为 `string`，可用于提示词、角色描述和其他字符串输入。
 
 ### 10. gaussian splatting converter (ply/spz)（`ZNGBNodes/3d`）
 通过 [`3dgsconverter`](https://github.com/francescofugazzi/3dgsconverter) 对 **3D 高斯泼溅（Gaussian Splatting）模型**做格式转换 / 无损压缩。典型场景：把一个很大的 3DGS `.ply`压成体积很小的 `.spz`。

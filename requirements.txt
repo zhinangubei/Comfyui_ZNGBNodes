@@ -5,6 +5,9 @@ git+https://github.com/francescofugazzi/3dgsconverter.git@0.9.0
 numpy==1.26.4
 opencv-python-headless==4.10.0.84
 
+# Alibaba Cloud Model Studio OpenAI-compatible Qwen API nodes.
+openai>=1.55.0
+
 # Local ModelScope LaMa image inpainting node.
 modelscope==1.38.1
 addict==2.4.0

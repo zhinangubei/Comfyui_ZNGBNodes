@@ -1144,6 +1144,78 @@ class ZNGBFloat:
 
 
 # ---------------------------------------------------------------------------
+# 9b. Text
+# ---------------------------------------------------------------------------
+
+class ZNGBText:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": True}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("string",)
+    FUNCTION = "get_text"
+    CATEGORY = "ZNGBNodes/utils"
+    DESCRIPTION = "A multiline text input that returns the text unchanged."
+
+    def get_text(self, text):
+        return (text,)
+
+
+# ---------------------------------------------------------------------------
+# 9c. Text To Text List
+# ---------------------------------------------------------------------------
+
+class ZNGBTextToTextList:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": True}),
+                "delimiter": ("STRING", {"default": "\\n"}),
+                "strip_whitespace": ("BOOLEAN", {"default": False}),
+                "remove_empty": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("list",)
+    OUTPUT_IS_LIST = (True,)
+    FUNCTION = "split_text"
+    CATEGORY = "ZNGBNodes/utils"
+    DESCRIPTION = "Split text into a STRING list with an escaped or literal delimiter."
+
+    @staticmethod
+    def _decode_delimiter(delimiter):
+        escapes = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\"}
+        decoded = []
+        index = 0
+        while index < len(delimiter):
+            if delimiter[index] == "\\" and index + 1 < len(delimiter):
+                escaped = escapes.get(delimiter[index + 1])
+                if escaped is not None:
+                    decoded.append(escaped)
+                    index += 2
+                    continue
+            decoded.append(delimiter[index])
+            index += 1
+        return "".join(decoded)
+
+    def split_text(self, text, delimiter, strip_whitespace, remove_empty):
+        separator = self._decode_delimiter(delimiter)
+        items = text.split(separator) if separator else [text]
+        if strip_whitespace:
+            items = [item.strip() for item in items]
+        if remove_empty:
+            items = [item for item in items if item != ""]
+        return (items,)
+
+
+# ---------------------------------------------------------------------------
 # 10. Equirect 360 To Views (extract perspective views from a panorama)
 # ---------------------------------------------------------------------------
 
@@ -1563,6 +1635,89 @@ class CropImgByBBoxes:
         return (crops,)
 
 
+class ZNGBMasksToMask:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"masks": ("MASK",)}}
+
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("mask",)
+    INPUT_IS_LIST = True
+    OUTPUT_IS_LIST = (False,)
+    FUNCTION = "combine"
+    CATEGORY = "ZNGBNodes/image"
+    DESCRIPTION = "Combine every mask from all SAM3 batches into one mask using a pixel-wise union."
+
+    def combine(self, masks):
+        if masks is None:
+            raise ValueError("masks cannot be null")
+        if isinstance(masks, torch.Tensor):
+            masks = [masks]
+
+        batches = []
+        for mask_batch in masks:
+            if mask_batch is None:
+                continue
+            if not isinstance(mask_batch, torch.Tensor):
+                raise TypeError("every masks input must be a torch tensor")
+            if mask_batch.dim() == 2:
+                mask_batch = mask_batch.unsqueeze(0)
+            if mask_batch.dim() != 3:
+                raise ValueError("masks must have shape [N, H, W] or [H, W]")
+            if mask_batch.shape[0] > 0:
+                batches.append(mask_batch)
+
+        if not batches:
+            raise ValueError("masks must contain at least one mask")
+        height, width = batches[0].shape[-2:]
+        if any(batch.shape[-2:] != (height, width) for batch in batches):
+            raise ValueError("all masks must have the same height and width")
+
+        combined = torch.cat(batches, dim=0).amax(dim=0, keepdim=True)
+        return (combined.clamp(0.0, 1.0),)
+
+
+class ZNGBMaskFillHole:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mask": ("MASK",),
+                "invert_mask": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("mask",)
+    FUNCTION = "fill"
+    CATEGORY = "ZNGBNodes/image"
+    DESCRIPTION = "Fill enclosed holes in each binary mask, with optional output inversion."
+
+    def fill(self, mask, invert_mask):
+        from scipy import ndimage
+
+        if mask is None:
+            raise ValueError("mask cannot be null")
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0)
+        if mask.dim() != 3:
+            raise ValueError("mask must have shape [B, H, W] or [H, W]")
+        if mask.shape[0] == 0:
+            return (mask.to(dtype=torch.float32),)
+
+        structure = ndimage.generate_binary_structure(2, 2)
+        outputs = []
+        for current_mask in mask:
+            binary = current_mask.detach().cpu().numpy() > (127.0 / 255.0)
+            filled = ndimage.binary_fill_holes(binary, structure=structure)
+            if invert_mask:
+                filled = ~filled
+            outputs.append(torch.from_numpy(filled.astype(np.float32)))
+
+        result = torch.stack(outputs).to(device=mask.device, dtype=torch.float32)
+        return (result,)
+
+
 class ImageAddMasks:
     @classmethod
     def INPUT_TYPES(cls):
@@ -1609,6 +1764,219 @@ class ImageAddMasks:
             rgba = torch.cat((source, mask.clamp(0.0, 1.0).unsqueeze(-1)), dim=-1)
             outputs.append(rgba.unsqueeze(0))
         return (outputs,)
+
+
+class ZNGBCheckerboardToMasks:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"image": ("IMAGE",)}}
+
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("masks",)
+    FUNCTION = "segment"
+    CATEGORY = "ZNGBNodes/image"
+    DESCRIPTION = ("Removes a baked-in light checkerboard background and returns one mask "
+                   "for each disconnected foreground element. Uses the alpha channel when present.")
+
+    @staticmethod
+    def _checkerboard_colors(rgb):
+        pixels = rgb.reshape(-1, 3)
+        quantized = (pixels // 4) * 4
+        colors, counts = np.unique(quantized, axis=0, return_counts=True)
+        brightness = colors.mean(axis=1)
+        neutrality = colors.max(axis=1) - colors.min(axis=1)
+        candidates = np.where((brightness >= 180) & (neutrality <= 24))[0]
+        if candidates.size < 2:
+            raise ValueError("Could not detect two light checkerboard background colors")
+
+        ordered = candidates[np.argsort(counts[candidates])[::-1]]
+        first = colors[ordered[0]].astype(np.float32) + 1.5
+        second = None
+        for index in ordered[1:]:
+            candidate = colors[index].astype(np.float32) + 1.5
+            distance = np.linalg.norm(candidate - first)
+            if 6.0 <= distance <= 80.0:
+                second = candidate
+                break
+        if second is None:
+            raise ValueError("Could not distinguish the two checkerboard background colors")
+        return first, second
+
+    @staticmethod
+    def _foreground_from_checkerboard(rgb):
+        color_a, color_b = ZNGBCheckerboardToMasks._checkerboard_colors(rgb)
+        pixels = rgb.astype(np.float32)
+        distance_a = np.linalg.norm(pixels - color_a, axis=2)
+        distance_b = np.linalg.norm(pixels - color_b, axis=2)
+        background_distance = np.minimum(distance_a, distance_b)
+
+        # JPEG compression and resized checkerboards produce many colors around the
+        # two nominal tile colors. Keep only candidates connected to the canvas edge
+        # so similarly colored pixels enclosed by an object are not removed.
+        background_like = (background_distance <= 30.0).astype(np.uint8)
+
+        flood_source = np.pad(background_like, 1, mode="constant", constant_values=1)
+        flood_mask = np.zeros((flood_source.shape[0] + 2, flood_source.shape[1] + 2), np.uint8)
+        cv2.floodFill(flood_source, flood_mask, (0, 0), 2)
+        exterior_background = flood_source[1:-1, 1:-1] == 2
+
+        # Generated cutouts often bake a neutral drop shadow into the RGB image.
+        # Grow the exterior only through low-saturation pixels, stopping at colored
+        # artwork and dark outlines. This also consumes isolated checkerboard halos.
+        saturation = pixels.max(axis=2) - pixels.min(axis=2)
+        brightness = pixels.mean(axis=2)
+        neutral_background = (
+            (saturation <= 18.0)
+            & (brightness >= 105.0)
+            & (background_distance <= 34.0)
+        ).astype(np.uint8)
+        background_candidates = ((neutral_background > 0) | exterior_background).astype(np.uint8)
+        _, candidate_labels = cv2.connectedComponents(background_candidates, connectivity=8)
+        exterior_labels = np.unique(candidate_labels[exterior_background])
+        expanded_background = np.isin(candidate_labels, exterior_labels) & (candidate_labels > 0)
+
+        foreground = (~expanded_background).astype(np.uint8)
+        return foreground
+
+    @staticmethod
+    def _foreground_for_frame(frame):
+        if frame.shape[-1] >= 4 and np.any(frame[..., 3] < 0.999):
+            alpha = np.clip(frame[..., 3], 0.0, 1.0).astype(np.float32)
+            return (alpha > 0.01).astype(np.uint8), alpha
+
+        rgb = np.clip(frame[..., :3] * 255.0, 0, 255).astype(np.uint8)
+        return ZNGBCheckerboardToMasks._foreground_from_checkerboard(rgb), None
+
+    @staticmethod
+    def _component_masks(foreground, alpha=None):
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(foreground, connectivity=8)
+        min_area = max(16, int(foreground.size * 0.0002))
+        components = []
+        for label in range(1, count):
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            if area < min_area:
+                continue
+            component = (labels == label).astype(np.float32)
+            if alpha is not None:
+                component *= alpha
+            else:
+                component = cv2.GaussianBlur(component, (0, 0), sigmaX=0.65)
+            components.append((area, np.clip(component, 0.0, 1.0)))
+        components.sort(key=lambda item: item[0], reverse=True)
+        return [component for _, component in components]
+
+    def segment(self, image):
+        if image is None or len(image) == 0:
+            raise ValueError("image must contain at least one image")
+
+        output_masks = []
+        for frame in image.detach().cpu().numpy():
+            foreground, alpha = self._foreground_for_frame(frame)
+            output_masks.extend(self._component_masks(foreground, alpha))
+
+        if not output_masks:
+            raise ValueError("No disconnected foreground elements were found")
+        return (torch.from_numpy(np.stack(output_masks)).to(dtype=torch.float32),)
+
+
+class ZNGBCheckerboardToBBoxes:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "padding_ratio": ("FLOAT", {
+                    "default": 0.08, "min": 0.0, "max": 0.5, "step": 0.01,
+                    "tooltip": "Expand each robust box by this fraction for SAM3 prompting.",
+                }),
+                "outlier_percent": ("FLOAT", {
+                    "default": 0.5, "min": 0.0, "max": 5.0, "step": 0.1,
+                    "tooltip": "Ignore this percentage of component pixels at each outer edge.",
+                }),
+                "min_area_ratio": ("FLOAT", {
+                    "default": 0.0002, "min": 0.0, "max": 0.1, "step": 0.0001,
+                    "tooltip": "Discard components smaller than this fraction of the image area.",
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("BOUNDING_BOX",)
+    RETURN_NAMES = ("bboxes",)
+    FUNCTION = "detect"
+    CATEGORY = "ZNGBNodes/image"
+    DESCRIPTION = ("Finds disconnected elements on a checkerboard background and returns "
+                   "per-frame bounding boxes compatible with the official SAM3 Detect node.")
+
+    @staticmethod
+    def _robust_box(labels, label, width, height, outlier_percent, padding_ratio):
+        ys, xs = np.where(labels == label)
+        low = float(outlier_percent)
+        high = 100.0 - low
+        left = int(math.floor(np.percentile(xs, low)))
+        top = int(math.floor(np.percentile(ys, low)))
+        right = int(math.ceil(np.percentile(xs, high))) + 1
+        bottom = int(math.ceil(np.percentile(ys, high))) + 1
+
+        box_width = max(1, right - left)
+        box_height = max(1, bottom - top)
+        if padding_ratio > 0:
+            pad_x = max(4, int(math.ceil(box_width * padding_ratio)))
+            pad_y = max(4, int(math.ceil(box_height * padding_ratio)))
+            left = max(0, left - pad_x)
+            top = max(0, top - pad_y)
+            right = min(width, right + pad_x)
+            bottom = min(height, bottom + pad_y)
+
+        return {
+            "x": left,
+            "y": top,
+            "width": right - left,
+            "height": bottom - top,
+        }
+
+    def detect(self, image, padding_ratio, outlier_percent, min_area_ratio):
+        if image is None or len(image) == 0:
+            raise ValueError("image must contain at least one image")
+
+        per_frame_boxes = []
+        for frame in image.detach().cpu().numpy():
+            foreground, _ = ZNGBCheckerboardToMasks._foreground_for_frame(frame)
+            height, width = foreground.shape
+            count, labels, stats, _ = cv2.connectedComponentsWithStats(foreground, connectivity=8)
+            min_area = max(16, int(foreground.size * min_area_ratio))
+            components = []
+            for label in range(1, count):
+                area = int(stats[label, cv2.CC_STAT_AREA])
+                if area < min_area:
+                    continue
+                core_box = self._robust_box(
+                    labels, label, width, height, outlier_percent, 0.0
+                )
+                box = self._robust_box(
+                    labels, label, width, height, outlier_percent, padding_ratio
+                )
+                components.append((area, box, core_box))
+            components.sort(key=lambda item: item[0], reverse=True)
+            boxes = []
+            core_boxes = []
+            for _, box, core_box in components:
+                right = core_box["x"] + core_box["width"]
+                bottom = core_box["y"] + core_box["height"]
+                contained = any(
+                    core_box["x"] >= parent["x"]
+                    and core_box["y"] >= parent["y"]
+                    and right <= parent["x"] + parent["width"]
+                    and bottom <= parent["y"] + parent["height"]
+                    for parent in core_boxes
+                )
+                if not contained:
+                    boxes.append(box)
+                    core_boxes.append(core_box)
+            per_frame_boxes.append(boxes)
+
+        if not any(per_frame_boxes):
+            raise ValueError("No disconnected foreground elements were found")
+        return (per_frame_boxes,)
 
 
 class ZNGBGaussianSplattingConverter:
@@ -1740,7 +2108,11 @@ NODE_CLASS_MAPPINGS = {
     "LamaInpainting_zngb": LamaInpainting_zngb,
     "CropImageByBBoxes_zngb": CropImageByBBoxes,
     "CropImgByBBoxes_zngb": CropImgByBBoxes,
+    "ZNGB_MasksToMask": ZNGBMasksToMask,
+    "ZNGB_MaskFillHole": ZNGBMaskFillHole,
     "ImageAddMasks_zngb": ImageAddMasks,
+    "ZNGB_CheckerboardToMasks": ZNGBCheckerboardToMasks,
+    "ZNGB_CheckerboardToBBoxes": ZNGBCheckerboardToBBoxes,
     "ZNGB_LoadVideoFromUrl": ZNGBLoadVideoFromUrl,
     "ZNGB_LoadAudioFromUrl": ZNGBLoadAudioFromUrl,
     "ZNGB_GetVideoComponents": ZNGBGetVideoComponents,
@@ -1754,6 +2126,8 @@ NODE_CLASS_MAPPINGS = {
     "ZNGB_VideoClip": ZNGBVideoClip,
     "ZNGB_VideoClipV2": ZNGBVideoClipV2,
     "ZNGB_Float": ZNGBFloat,
+    "ZNGB_Text": ZNGBText,
+    "ZNGB_TextToTextList": ZNGBTextToTextList,
     "ZNGB_Equirect360ToViews": ZNGBEquirect360ToViews,
     "ZNGB_LensDistortionCorrection": ZNGBLensDistortionCorrection,
     "ZNGB_GaussianSplattingConverter": ZNGBGaussianSplattingConverter,
@@ -1763,7 +2137,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LamaInpainting_zngb": "LamaInpainting_zngb",
     "CropImageByBBoxes_zngb": "crop image by bboxes",
     "CropImgByBBoxes_zngb": "crop img by bboxes",
+    "ZNGB_MasksToMask": "masks to mask",
+    "ZNGB_MaskFillHole": "Mask Fill Hole",
     "ImageAddMasks_zngb": "Image add Masks",
+    "ZNGB_CheckerboardToMasks": "checkerboard to element masks",
+    "ZNGB_CheckerboardToBBoxes": "checkerboard to element bboxes (SAM3)",
     "ZNGB_LoadVideoFromUrl": "load video from url",
     "ZNGB_LoadAudioFromUrl": "load audio from url",
     "ZNGB_GetVideoComponents": "get video components",
@@ -1777,6 +2155,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ZNGB_VideoClip": "video clip",
     "ZNGB_VideoClipV2": "video clip V2",
     "ZNGB_Float": "float",
+    "ZNGB_Text": "text",
+    "ZNGB_TextToTextList": "text2textlist ZNGB",
     "ZNGB_Equirect360ToViews": "Equirect360ToViews",
     "ZNGB_LensDistortionCorrection": "lens distortion correction (OpenCV)",
     "ZNGB_GaussianSplattingConverter": "gaussian splatting converter (ply/spz)",
