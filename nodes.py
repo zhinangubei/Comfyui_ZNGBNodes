@@ -1766,6 +1766,159 @@ class ImageAddMasks:
         return (outputs,)
 
 
+class ZNGBImageComposite:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "ori_image": ("IMAGE",),
+                "paddleocr_json": ("STRING", {"forceInput": True}),
+                "text_rgba_image": ("IMAGE",),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE")
+    RETURN_NAMES = ("rgba_text_batch", "rgba_text_img")
+    INPUT_IS_LIST = True
+    OUTPUT_IS_LIST = (False, False)
+    FUNCTION = "composite"
+    CATEGORY = "ZNGBNodes/image"
+
+    @staticmethod
+    def _parse_entries(paddleocr_json):
+        if paddleocr_json is None or paddleocr_json == "":
+            return []
+        data = (
+            json.loads(paddleocr_json)
+            if isinstance(paddleocr_json, str)
+            else paddleocr_json
+        )
+        if not isinstance(data, dict):
+            raise ValueError("paddleocr_json must be a JSON object")
+
+        def sort_key(item):
+            key = str(item[0])
+            return (0, int(key)) if key.isdigit() else (1, key)
+
+        entries = [value for _, value in sorted(data.items(), key=sort_key)]
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict) or "bbox" not in entry:
+                raise ValueError(
+                    f"paddleocr_json item {index} must contain a bbox"
+                )
+        return entries
+
+    @staticmethod
+    def _first_input(value, name):
+        if isinstance(value, list):
+            if not value:
+                raise ValueError(f"{name} cannot be empty")
+            return value[0]
+        return value
+
+    @staticmethod
+    def _flatten_rgba_images(text_rgba_image):
+        batches = (
+            text_rgba_image
+            if isinstance(text_rgba_image, list)
+            else [text_rgba_image]
+        )
+        images = []
+        for batch in batches:
+            if not isinstance(batch, torch.Tensor) or batch.ndim != 4:
+                raise ValueError(
+                    "text_rgba_image must contain tensors shaped [B, H, W, 4]"
+                )
+            if batch.shape[-1] < 4:
+                raise ValueError("text_rgba_image must contain RGBA images")
+            images.extend(
+                item[..., :4].detach().float().clamp(0.0, 1.0)
+                for item in batch
+            )
+        return images
+
+    def composite(self, ori_image, paddleocr_json, text_rgba_image):
+        ori_image = self._first_input(ori_image, "ori_image")
+        paddleocr_json = self._first_input(paddleocr_json, "paddleocr_json")
+        if ori_image.ndim != 4 or ori_image.shape[0] == 0:
+            raise ValueError("ori_image must have shape [B, H, W, C]")
+        if paddleocr_json is None or paddleocr_json == "":
+            return (ori_image, ori_image)
+
+        entries = self._parse_entries(paddleocr_json)
+        height, width = ori_image.shape[1:3]
+        rgba_images = self._flatten_rgba_images(text_rgba_image)
+        output_device = rgba_images[0].device if rgba_images else ori_image.device
+        if not entries:
+            transparent = torch.zeros((1, height, width, 4), device=output_device)
+            return (transparent, transparent)
+        if len(rgba_images) != len(entries):
+            raise ValueError(
+                "text_rgba_image batch size must match paddleocr_json item count; "
+                f"got {len(rgba_images)} images and {len(entries)} items"
+            )
+
+        output_images = []
+        for index, (rgba_image, entry) in enumerate(zip(rgba_images, entries)):
+            bbox = entry["bbox"]
+            if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+                raise ValueError(
+                    f"paddleocr_json item {index} bbox must contain four values"
+                )
+            raw_x1, raw_y1, raw_x2, raw_y2 = (
+                int(round(float(value))) for value in bbox[:4]
+            )
+            box_width = raw_x2 - raw_x1
+            box_height = raw_y2 - raw_y1
+            if box_width <= 0 or box_height <= 0:
+                raise ValueError(
+                    f"paddleocr_json item {index} has an invalid bbox: {bbox}"
+                )
+
+            resized = F.interpolate(
+                rgba_image.permute(2, 0, 1).unsqueeze(0),
+                size=(box_height, box_width),
+                mode="bilinear",
+                align_corners=False,
+            )[0].permute(1, 2, 0)
+
+            x1 = max(0, min(width, raw_x1))
+            y1 = max(0, min(height, raw_y1))
+            x2 = max(0, min(width, raw_x2))
+            y2 = max(0, min(height, raw_y2))
+            canvas = rgba_image.new_zeros((height, width, 4))
+            if x2 > x1 and y2 > y1:
+                source_x1 = x1 - raw_x1
+                source_y1 = y1 - raw_y1
+                source_x2 = source_x1 + (x2 - x1)
+                source_y2 = source_y1 + (y2 - y1)
+                canvas[y1:y2, x1:x2] = resized[
+                    source_y1:source_y2,
+                    source_x1:source_x2,
+                ]
+            output_images.append(canvas)
+
+        rgba_text_batch = torch.stack(output_images, dim=0)
+        merged_rgb = rgba_text_batch.new_zeros((height, width, 3))
+        merged_alpha = rgba_text_batch.new_zeros((height, width, 1))
+        for layer in rgba_text_batch:
+            source_alpha = layer[..., 3:4]
+            output_alpha = source_alpha + merged_alpha * (1.0 - source_alpha)
+            premultiplied_rgb = (
+                layer[..., :3] * source_alpha
+                + merged_rgb * merged_alpha * (1.0 - source_alpha)
+            )
+            merged_rgb = torch.where(
+                output_alpha > 0.0,
+                premultiplied_rgb / output_alpha.clamp_min(1e-8),
+                torch.zeros_like(premultiplied_rgb),
+            )
+            merged_alpha = output_alpha
+
+        rgba_text_img = torch.cat((merged_rgb, merged_alpha), dim=-1).unsqueeze(0)
+        return (rgba_text_batch, rgba_text_img)
+
+
 class ZNGBCheckerboardToMasks:
     @classmethod
     def INPUT_TYPES(cls):
@@ -2111,6 +2264,7 @@ NODE_CLASS_MAPPINGS = {
     "ZNGB_MasksToMask": ZNGBMasksToMask,
     "ZNGB_MaskFillHole": ZNGBMaskFillHole,
     "ImageAddMasks_zngb": ImageAddMasks,
+    "ZNGB_ImageComposite": ZNGBImageComposite,
     "ZNGB_CheckerboardToMasks": ZNGBCheckerboardToMasks,
     "ZNGB_CheckerboardToBBoxes": ZNGBCheckerboardToBBoxes,
     "ZNGB_LoadVideoFromUrl": ZNGBLoadVideoFromUrl,
@@ -2140,6 +2294,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ZNGB_MasksToMask": "masks to mask",
     "ZNGB_MaskFillHole": "Mask Fill Hole",
     "ImageAddMasks_zngb": "Image add Masks",
+    "ZNGB_ImageComposite": "image composite",
     "ZNGB_CheckerboardToMasks": "checkerboard to element masks",
     "ZNGB_CheckerboardToBBoxes": "checkerboard to element bboxes (SAM3)",
     "ZNGB_LoadVideoFromUrl": "load video from url",
