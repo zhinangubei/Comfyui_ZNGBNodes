@@ -1635,6 +1635,148 @@ class CropImgByBBoxes:
         return (crops,)
 
 
+class ZNGBBBoxesResize:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "ori_img_W": ("INT", {"default": 1024, "min": 1, "max": MAX_RESOLUTION, "step": 1}),
+                "ori_img_H": ("INT", {"default": 1024, "min": 1, "max": MAX_RESOLUTION, "step": 1}),
+                "tgt_img_W": ("INT", {"default": 1024, "min": 1, "max": MAX_RESOLUTION, "step": 1}),
+                "tgt_img_H": ("INT", {"default": 1024, "min": 1, "max": MAX_RESOLUTION, "step": 1}),
+                "ori_bboxes": ("BOUNDING_BOX",),
+            },
+        }
+
+    RETURN_TYPES = ("BOUNDING_BOX",)
+    RETURN_NAMES = ("bboxes",)
+    FUNCTION = "resize"
+    CATEGORY = "ZNGBNodes/image"
+    DESCRIPTION = ("Scale bounding boxes from the original image size to a target image size. "
+                   "Output boxes stay in official x/y/width/height format.")
+
+    @staticmethod
+    def _scale_box(box, scale_x, scale_y, tgt_w, tgt_h):
+        if not isinstance(box, dict):
+            raise TypeError("each bbox must be a dictionary with x, y, width, and height")
+        try:
+            x = float(box["x"]) * scale_x
+            y = float(box["y"]) * scale_y
+            width = float(box["width"]) * scale_x
+            height = float(box["height"]) * scale_y
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "each bbox must contain numeric x, y, width, and height values"
+            ) from exc
+
+        x1 = max(0.0, min(float(tgt_w), x))
+        y1 = max(0.0, min(float(tgt_h), y))
+        x2 = max(0.0, min(float(tgt_w), x + width))
+        y2 = max(0.0, min(float(tgt_h), y + height))
+        scaled = dict(box)
+        scaled["x"] = int(round(x1))
+        scaled["y"] = int(round(y1))
+        scaled["width"] = int(round(x2 - x1))
+        scaled["height"] = int(round(y2 - y1))
+        return scaled
+
+    def resize(self, ori_img_W, ori_img_H, tgt_img_W, tgt_img_H, ori_bboxes):
+        if int(ori_img_W) <= 0 or int(ori_img_H) <= 0:
+            raise ValueError("ori_img_W and ori_img_H must be greater than 0")
+        if int(tgt_img_W) <= 0 or int(tgt_img_H) <= 0:
+            raise ValueError("tgt_img_W and tgt_img_H must be greater than 0")
+
+        scale_x = float(tgt_img_W) / float(ori_img_W)
+        scale_y = float(tgt_img_H) / float(ori_img_H)
+
+        if isinstance(ori_bboxes, dict):
+            return ([self._scale_box(ori_bboxes, scale_x, scale_y, tgt_img_W, tgt_img_H)],)
+        if not isinstance(ori_bboxes, list):
+            raise TypeError(
+                "ori_bboxes must be a dict, a list of dicts, or a per-frame list of dicts"
+            )
+        if not ori_bboxes:
+            return ([],)
+        if isinstance(ori_bboxes[0], list):
+            return ([
+                [
+                    self._scale_box(box, scale_x, scale_y, tgt_img_W, tgt_img_H)
+                    for box in frame
+                ]
+                for frame in ori_bboxes
+            ],)
+        return ([
+            self._scale_box(box, scale_x, scale_y, tgt_img_W, tgt_img_H)
+            for box in ori_bboxes
+        ],)
+
+
+class CropImageByMasks:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "masks": ("MASK",),
+                "mask_threshold": ("FLOAT", {
+                    "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01,
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image_list",)
+    OUTPUT_IS_LIST = (True,)
+    FUNCTION = "crop"
+    CATEGORY = "ZNGBNodes/image"
+    DESCRIPTION = ("Crops one RGBA image per CropFormer / SAM mask. Each output keeps "
+                   "the source RGB inside that mask and uses the mask's own bounding-box size.")
+
+    def crop(self, image, masks, mask_threshold):
+        if image is None or len(image) == 0:
+            raise ValueError("image must contain at least one image")
+        if masks is None:
+            raise ValueError("masks cannot be null")
+
+        if masks.dim() == 2:
+            masks = masks.unsqueeze(0)
+        if masks.dim() != 3:
+            raise ValueError("masks must have shape [N, H, W] or [H, W]")
+        if masks.shape[0] == 0:
+            raise ValueError("masks must contain at least one mask")
+
+        source = image[0]
+        height, width = source.shape[:2]
+        rgb = source[:, :, :3]
+        resized_masks = masks.to(device=source.device, dtype=source.dtype)
+        if resized_masks.shape[-2:] != (height, width):
+            resized_masks = F.interpolate(
+                resized_masks.unsqueeze(1),
+                size=(height, width),
+                mode="nearest",
+            ).squeeze(1)
+        resized_masks = resized_masks.clamp(0.0, 1.0)
+        threshold = float(mask_threshold)
+
+        crops = []
+        for mask in resized_masks:
+            ys, xs = torch.where(mask >= threshold)
+            if ys.numel() == 0:
+                continue
+            top = int(ys.min())
+            bottom = int(ys.max()) + 1
+            left = int(xs.min())
+            right = int(xs.max()) + 1
+            crop_rgb = rgb[top:bottom, left:right]
+            crop_alpha = mask[top:bottom, left:right]
+            rgba = torch.cat((crop_rgb, crop_alpha.unsqueeze(-1)), dim=-1)
+            crops.append(rgba.unsqueeze(0))
+
+        if not crops:
+            raise ValueError("No masks overlap the input image")
+        return (crops,)
+
+
 class ZNGBMasksToMask:
     @classmethod
     def INPUT_TYPES(cls):
@@ -1675,6 +1817,52 @@ class ZNGBMasksToMask:
 
         combined = torch.cat(batches, dim=0).amax(dim=0, keepdim=True)
         return (combined.clamp(0.0, 1.0),)
+
+
+class ZNGBMaskListToMaskBatch:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"masks": ("MASK",)}}
+
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("masks",)
+    INPUT_IS_LIST = True
+    OUTPUT_IS_LIST = (False,)
+    FUNCTION = "convert"
+    CATEGORY = "ZNGBNodes/image"
+    DESCRIPTION = "Convert a same-resolution MASK list into one MASK batch."
+
+    def convert(self, masks):
+        if masks is None:
+            raise ValueError("masks cannot be null")
+        if isinstance(masks, torch.Tensor):
+            masks = [masks]
+
+        batches = []
+        for mask_batch in masks:
+            if mask_batch is None:
+                continue
+            if not isinstance(mask_batch, torch.Tensor):
+                raise TypeError("every masks input must be a torch tensor")
+            if mask_batch.dim() == 2:
+                mask_batch = mask_batch.unsqueeze(0)
+            if mask_batch.dim() != 3:
+                raise ValueError("masks must have shape [N, H, W] or [H, W]")
+            if mask_batch.shape[0] > 0:
+                batches.append(mask_batch.to(dtype=torch.float32))
+
+        if not batches:
+            raise ValueError("masks must contain at least one mask")
+        height, width = batches[0].shape[-2:]
+        if any(batch.shape[-2:] != (height, width) for batch in batches):
+            raise ValueError("all masks must have the same height and width")
+
+        device = batches[0].device
+        stacked = torch.cat(
+            [batch.to(device=device) for batch in batches],
+            dim=0,
+        )
+        return (stacked.clamp(0.0, 1.0),)
 
 
 class ZNGBMaskFillHole:
@@ -1728,13 +1916,13 @@ class ImageAddMasks:
             },
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image_list",)
-    OUTPUT_IS_LIST = (True,)
+    RETURN_TYPES = ("IMAGE", "IMAGE")
+    RETURN_NAMES = ("image_list", "image")
+    OUTPUT_IS_LIST = (True, False)
     FUNCTION = "add_masks"
     CATEGORY = "ZNGBNodes/image"
-    DESCRIPTION = ("Adds each SAM3 individual mask to the same source image as an alpha channel "
-                   "and returns one RGBA image per mask.")
+    DESCRIPTION = ("Adds each SAM3 individual mask to the same source image as an alpha channel, "
+                   "returns one RGBA image per mask, and one combined RGBA image that contains all masks.")
 
     def add_masks(self, image, masks):
         if image is None or len(image) == 0:
@@ -1758,12 +1946,16 @@ class ImageAddMasks:
                 size=(height, width),
                 mode="nearest",
             ).squeeze(1)
+        resized_masks = resized_masks.clamp(0.0, 1.0)
 
         outputs = []
         for mask in resized_masks:
-            rgba = torch.cat((source, mask.clamp(0.0, 1.0).unsqueeze(-1)), dim=-1)
+            rgba = torch.cat((source, mask.unsqueeze(-1)), dim=-1)
             outputs.append(rgba.unsqueeze(0))
-        return (outputs,)
+
+        combined_alpha = resized_masks.amax(dim=0)
+        combined = torch.cat((source, combined_alpha.unsqueeze(-1)), dim=-1).unsqueeze(0)
+        return (outputs, combined)
 
 
 class ZNGBImageComposite:
@@ -2261,7 +2453,10 @@ NODE_CLASS_MAPPINGS = {
     "LamaInpainting_zngb": LamaInpainting_zngb,
     "CropImageByBBoxes_zngb": CropImageByBBoxes,
     "CropImgByBBoxes_zngb": CropImgByBBoxes,
+    "ZNGB_BBoxesResize": ZNGBBBoxesResize,
+    "CropImageByMasks_zngb": CropImageByMasks,
     "ZNGB_MasksToMask": ZNGBMasksToMask,
+    "ZNGB_MaskListToMaskBatch": ZNGBMaskListToMaskBatch,
     "ZNGB_MaskFillHole": ZNGBMaskFillHole,
     "ImageAddMasks_zngb": ImageAddMasks,
     "ZNGB_ImageComposite": ZNGBImageComposite,
@@ -2290,7 +2485,10 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LamaInpainting_zngb": "LamaInpainting_zngb",
     "CropImageByBBoxes_zngb": "crop image by bboxes",
+    "CropImageByMasks_zngb": "crop image by masks",
     "CropImgByBBoxes_zngb": "crop img by bboxes",
+    "ZNGB_BBoxesResize": "bboxes resize",
+    "ZNGB_MaskListToMaskBatch": "masklist2maskbatch",
     "ZNGB_MasksToMask": "masks to mask",
     "ZNGB_MaskFillHole": "Mask Fill Hole",
     "ImageAddMasks_zngb": "Image add Masks",
